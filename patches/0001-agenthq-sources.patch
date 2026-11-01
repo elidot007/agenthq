@@ -1,0 +1,1825 @@
+From e13ab66a1ab5e5ce099d6010170a18c1a1b8a0a6 Mon Sep 17 00:00:00 2001
+From: AgentHQ contributors <agenthq@localhost>
+Date: Sun, 1 Nov 2026 07:26:03 -0800
+Subject: [PATCH] feat: AgentHQ Sources and GitHub-optional setup
+
+- GitHub Source becomes optional: a deployment without it skips the GitHub account, gh shim and credential helper
+- New local Sources: inbox (Markdown notes per business), timer (cron schedules and ticket wakes), spool (JSON drop folder for programs)
+- A throttling 403 from a model relay counts as a transient error and is retried
+---
+ cordis.patch.yml                  |  10 ++
+ docs/007-architecture.md          |  13 +-
+ package.json                      |   3 +
+ src/app/setup.ts                  |  10 +-
+ src/client/deployment.tsx         |   4 +-
+ src/client/locales.ts             |   6 +
+ src/deployment.ts                 |  12 ++
+ src/executor/dsh.ts               |  10 +-
+ src/infra/commands.ts             |  10 +-
+ src/infra/environment.ts          |  15 +-
+ src/kv.ts                         |   4 +
+ src/sources/cron.ts               |  63 ++++++++
+ src/sources/github.ts             |   4 +-
+ src/sources/inbox-note.ts         |  69 +++++++++
+ src/sources/inbox.ts              | 232 ++++++++++++++++++++++++++++++
+ src/sources/local-files.ts        |  78 ++++++++++
+ src/sources/spool.ts              | 191 ++++++++++++++++++++++++
+ src/sources/timer.ts              | 228 +++++++++++++++++++++++++++++
+ tests/bundle-patch.spec.ts        |   4 +-
+ tests/deployment.spec.ts          |  11 +-
+ tests/environment.spec.ts         |  29 +++-
+ tests/fixtures/local-sources.ts   |  47 ++++++
+ tests/inbox.spec.ts               | 121 ++++++++++++++++
+ tests/runtime-concurrency.spec.ts |   7 +-
+ tests/runtime.spec.ts             |  16 ++-
+ tests/spool.spec.ts               |  59 ++++++++
+ tests/timer.spec.ts               | 116 +++++++++++++++
+ tests/tools.spec.ts               |  15 +-
+ tsdown.config.ts                  |   3 +-
+ 29 files changed, 1353 insertions(+), 37 deletions(-)
+ create mode 100644 src/sources/cron.ts
+ create mode 100644 src/sources/inbox-note.ts
+ create mode 100644 src/sources/inbox.ts
+ create mode 100644 src/sources/local-files.ts
+ create mode 100644 src/sources/spool.ts
+ create mode 100644 src/sources/timer.ts
+ create mode 100644 tests/fixtures/local-sources.ts
+ create mode 100644 tests/inbox.spec.ts
+ create mode 100644 tests/spool.spec.ts
+ create mode 100644 tests/timer.spec.ts
+
+diff --git a/cordis.patch.yml b/cordis.patch.yml
+index 5ada6df..1446c5f 100644
+--- a/cordis.patch.yml
++++ b/cordis.patch.yml
+@@ -10,6 +10,16 @@
+     - id: dsh-superagent-feishu
+       name: dsh-superagent/feishu-watch
+       disabled: true
++    # Optional local Sources: Markdown notes per business, schedules and ticket wakes, and a JSON drop folder for local programs.
++    - id: dsh-superagent-inbox
++      name: dsh-superagent/inbox-watch
++      disabled: true
++    - id: dsh-superagent-timer
++      name: dsh-superagent/timer-watch
++      disabled: true
++    - id: dsh-superagent-spool
++      name: dsh-superagent/spool-watch
++      disabled: true
+     # The agent preset of every Executor Session (WORKER_PRESET in src/app/sessions.ts); the main Session has its own, below.
+     # It is DSH's `standard` preset with only what a worker needs, and a shell whose foreground command moves to a background job
+     # after 5 seconds, so a long command does not hold back a person's message, which the Session takes at its next step. Left
+diff --git a/docs/007-architecture.md b/docs/007-architecture.md
+index 184ea54..46e7f80 100644
+--- a/docs/007-architecture.md
++++ b/docs/007-architecture.md
+@@ -374,6 +374,12 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
+ | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
+ | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
++| `src/sources/local-files.ts` | What the local Sources share: listing a folder without its `.` and `_` names, once-only appends, moves, JSON reads and local timestamps |
++| `src/sources/inbox.ts` | The Inbox kind and plugin entry, exported as `./inbox-watch`: Markdown notes in one folder per business, each note a Thread and each passage its author writes a Trigger; replies are callouts appended to the note |
++| `src/sources/inbox-note.ts` | A note's front matter, passages and the agent's callouts with their `<!-- hq:<id> -->` markers, its title, and the callout a reply appends |
++| `src/sources/timer.ts` | The Timer kind and plugin entry, exported as `./timer-watch`: each occurrence of a schedule as the operator's request on a Thread of its own, written up in the schedule's log, and the wake requests that continue an open ticket at a time, when a file appears, or at a deadline |
++| `src/sources/cron.ts` | Five-field cron expressions on the host's local clock, their next occurrence, and the latest one of a missed stretch |
++| `src/sources/spool.ts` | The Spool kind and plugin entry, exported as `./spool-watch`: JSON request files that local programs drop into a folder, by listed senders, and JSON replies written into a folder per conversation |
+ | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
+ | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
+ | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
+@@ -397,7 +403,7 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
+ | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
+ 
+-`src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
++`src/sources/github.ts`, `src/sources/feishu.ts`, `src/sources/inbox.ts`, `src/sources/timer.ts` and `src/sources/spool.ts` are also the entries of the Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./feishu-watch`, `./inbox-watch`, `./timer-watch` and `./spool-watch`. The bundle's `cordis.patch.yml` inserts the plugins, with Feishu and the three local Sources disabled. Setup resolves GitHub only while its Source is on: with it off, the deployment has no repository or agent account, `gh` fails for workers, and the other Sources work alone.
+ 
+ ## Tests
+ 
+@@ -411,6 +417,9 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+ | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+ | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
++| `tests/inbox.spec.ts` | The Inbox Source: a note's parts, passage ids across re-reads and edits, settled and changed notes, drafts and reserved names, scope, variables and the once-only callouts |
++| `tests/timer.spec.ts` | Cron occurrences, schedules counted from when first seen, one Thread per occurrence and the schedule's log, and wake requests that reach an open ticket through the Thread it started on |
++| `tests/spool.spec.ts` | The Spool Source: relayed requests, unlisted senders and unreadable files, programs acting for themselves, and once-only reply files |
+ | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
+ | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
+ | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
+@@ -445,7 +454,7 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
+ | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
+ 
+-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
++`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `local-sources.ts`, a Store, Engine and context for the local Sources; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+ 
+ ## Persistence
+ 
+diff --git a/package.json b/package.json
+index 6afd24b..a314f55 100644
+--- a/package.json
++++ b/package.json
+@@ -16,6 +16,9 @@
+     "./client": "./lib/client.js",
+     "./github-watch": "./lib/github-watch.js",
+     "./feishu-watch": "./lib/feishu-watch.js",
++    "./inbox-watch": "./lib/inbox-watch.js",
++    "./timer-watch": "./lib/timer-watch.js",
++    "./spool-watch": "./lib/spool-watch.js",
+     "./package.json": "./package.json",
+     "./locale/*.json": "./locale/*.json"
+   },
+diff --git a/src/app/setup.ts b/src/app/setup.ts
+index a1d353f..359e4fb 100644
+--- a/src/app/setup.ts
++++ b/src/app/setup.ts
+@@ -1,7 +1,8 @@
+ /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
+ import type { Context } from '@deepseek-ai/cordis'
+ import { UserError } from '../core/index.ts'
+-import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
++import { SETUP_FIELDS, githubWanted, resolveDeployment, resolveFeishuBot, withoutGithub, workerProbe, type Deployment, type Machine }
++  from '../deployment.ts'
+ import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+ import type { Settings, SettingsBlock } from '../policy.ts'
+ import { SetupError, type SetupProblem } from '../setup.ts'
+@@ -13,8 +14,9 @@ export interface SetupHost {
+   restart(): void
+ }
+ 
++// Switching the GitHub Source on or off changes whether setup resolves GitHub at all, so it reruns setup as an account change does.
+ const setupFields = (settings: Settings) =>
+-  JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
++  JSON.stringify([githubWanted(settings), ...Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? ''))])
+ export const setupChanged = (before: Settings, after: Settings): boolean => setupFields(before) !== setupFields(after)
+ 
+ /**
+@@ -61,7 +63,7 @@ export class Setup {
+   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
+     const { machine } = this.host
+     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
+-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
++      : githubWanted(settings) ? resolveDeployment(machine, settings.sources.github?.config, this.probe()) : Promise.resolve(withoutGithub(machine))
+     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+   }
+   async blockCommands(blocked: readonly string[]): Promise<void> {
+@@ -76,7 +78,7 @@ export class Setup {
+   private async resolve(settings: Settings): Promise<Deployment> {
+     const { context, machine, lifetime } = this.host
+     const probe = this.probe()
+-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
++    const deployment = githubWanted(settings) ? await resolveDeployment(machine, settings.sources.github?.config, probe) : withoutGithub(machine)
+     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
+       if (!(error instanceof SetupError)) throw error
+       this.feishuProblem = error.problem
+diff --git a/src/client/deployment.tsx b/src/client/deployment.tsx
+index a345811..c61d4cc 100644
+--- a/src/client/deployment.tsx
++++ b/src/client/deployment.tsx
+@@ -62,8 +62,8 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
+         <p className="dt-error" role="status"><SetupMessage problem={setup.problem} lead /></p><CheckSetupButton />
+       </div>}
+       {showAccounts && <Section title={t('deploymentDerived')} hint={t('deploymentDerivedHint')}>
+-        <KeyValues rows={[[t('deploymentRepository'), accounts?.repository ?? '—'],
+-          [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
++        <KeyValues rows={[[t('deploymentRepository'), accounts?.repository || '—'],
++          [t('deploymentAgent'), accounts?.agent ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
+         <Hint>{t('deploymentAccountsWhere')}</Hint>
+       </Section>}
+       <Section title={t('deploymentMachine')}>
+diff --git a/src/client/locales.ts b/src/client/locales.ts
+index d81d0d4..df9ca99 100644
+--- a/src/client/locales.ts
++++ b/src/client/locales.ts
+@@ -33,6 +33,9 @@ const TEXT = {
+   'source.github': ['GitHub', 'GitHub'],
+   'source.github-issue': ['GitHub Issue', 'GitHub Issue'],
+   'health.github': ['GitHub 来源', 'GitHub Source'],
++  'health.inbox': ['收件箱来源', 'Inbox Source'],
++  'health.timer': ['定时来源', 'Timer Source'],
++  'health.spool': ['投递目录来源', 'Spool Source'],
+   'health.feishu': ['飞书来源', 'Feishu Source'],
+   'health.history': ['飞书补收', 'Feishu recovery'],
+   'health.runtime': ['dsh-superagent', 'dsh-superagent'],
+@@ -608,6 +611,9 @@ const TEXT = {
+   'reason.humanStop': ['有人要求停止', 'Someone asked to stop'],
+   'reason.forwarded': ['已扇出给该线程的工单', 'Fanned out to the Thread\'s Ticket'],
+   'reason.senderNotMember': ['发送者不在这个来源的名单里', 'Sender is not on this Source\'s list'],
++  'reason.inbox_unconfigured': ['收件箱没有设置根目录', 'The inbox has no root folder'],
++  'reason.business_not_listed': ['笔记所在的业务不在收件箱的业务里', 'The note\'s business is not one of the inbox\'s businesses'],
++  'reason.sender_not_listed': ['发送者不在投递目录的发送者里', 'The sender is not one of the spool\'s senders'],
+   'reason.source_disabled': ['来源已停用', 'Source disabled'],
+   'reason.issue_sender_or_admission_disabled': ['Issue 发起人不在名单或主动接单已关闭', 'Issue sender not on the list, or proactive accept off'],
+   'reason.source_not_installed': ['来源插件未加载', 'Source plugin not loaded'],
+diff --git a/src/deployment.ts b/src/deployment.ts
+index 76340cb..e1faa26 100644
+--- a/src/deployment.ts
++++ b/src/deployment.ts
+@@ -56,6 +56,18 @@ export interface Deployment extends Machine {
+   feishu?: FeishuBot
+ }
+ export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
++/**
++ * Whether setup resolves GitHub: unless the GitHub Source is switched off, its repository and agent CLI are required. With it
++ * off, an installation works from its other Sources, and its workers have no GitHub account.
++ */
++export const githubWanted = (settings: { sources: Record<string, { enabled: boolean } | undefined> }): boolean =>
++  settings.sources.github?.enabled !== false
++/** The deployment of an installation whose GitHub Source is off: no repository and no agent account, so gh fails for workers. */
++export function withoutGithub(machine: Machine): Deployment {
++  return { ...machine, repository: '', github: { cli: '', login: '', noreply: '' } }
++}
++/** True when setup resolved a GitHub repository and the agent's GitHub account. */
++export const hasGithub = (deployment: Pick<Deployment, 'github'>): boolean => deployment.github.cli !== ''
+ 
+ /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
+ export function executable(name: string, path: string, exclude?: string): string {
+diff --git a/src/executor/dsh.ts b/src/executor/dsh.ts
+index 26234f3..411c487 100644
+--- a/src/executor/dsh.ts
++++ b/src/executor/dsh.ts
+@@ -44,15 +44,17 @@ class PrepareFailed extends Error {}
+ const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
+   'network error', 'overloaded', 'rate limit', '\\b(?:408|429|50[0-4])\\b'].join('|'), 'i')
+ /**
+- * True when an error represents a transient network or model-provider failure: an HTTP 408, 429, or 5xx status, or a
+- * connection that was refused, reset, timed out, or could not resolve its host.
++ * True when an error represents a transient network or model-provider failure: an HTTP 408, 429, or 5xx status, a 403 whose
++ * text says the account is throttled for now, or a connection that was refused, reset, timed out, or could not resolve its host.
+  */
+ export function transient(error: unknown): boolean {
+   const status = (error as { status?: unknown } | undefined)?.status
+-  if (typeof status === 'number') return status === 408 || status === 429 || status >= 500
+   const text = error instanceof Error ? `${error.name} ${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
+-  return PASSING.test(text)
++  // A relay or upstream that throttles an account answers 403 and says the limit is temporary; that passes like a 429.
++  if (typeof status === 'number') return status === 408 || status === 429 || status >= 500 || (status === 403 && THROTTLED.test(text))
++  return PASSING.test(text) || (/\b403\b/.test(text) && THROTTLED.test(text))
+ }
++const THROTTLED = /风控|限流|稍后|rate.?limit|too many requests|temporar|throttl|risk control/i
+ /** Appends a stable 12-character ticket ID suffix to a validated English worktree name. */
+ const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
+ /** Host dependencies used by `DshExecutor`. */
+diff --git a/src/infra/commands.ts b/src/infra/commands.ts
+index 120f5a4..080990a 100644
+--- a/src/infra/commands.ts
++++ b/src/infra/commands.ts
+@@ -73,7 +73,13 @@ export class Commands {
+     } catch (error) { throw commandError(error, program) }
+   }
+   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
+-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
++  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.githubCli, args)) as T }
++  /** The agent's GitHub CLI; an installation whose GitHub Source is off has none, and every GitHub call fails plainly. */
++  private get githubCli(): string {
++    const { cli } = this.deployment.github
++    if (!cli) throw new Error('GitHub is not configured in this installation: its GitHub Source is off')
++    return cli
++  }
+   /**
+    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
+    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
+@@ -82,7 +88,7 @@ export class Commands {
+   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+   async api(path: string, ...flags: string[]): Promise<string>
+   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
++    if (typeof schema === 'string') return this.run(this.githubCli, ['api', this.path(schema), ...rest])
+     const [path = '', ...flags] = rest
+     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
+   }
+diff --git a/src/infra/environment.ts b/src/infra/environment.ts
+index b6d92c3..71b9078 100644
+--- a/src/infra/environment.ts
++++ b/src/infra/environment.ts
+@@ -97,10 +97,12 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
+   ].join('\n')
+   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+-  await shim('gh', run(github.cli))
++  // Without GitHub (its Source off), gh fails for workers, and github.com keeps no credential helper, so git cannot push there.
++  const agent = github.cli ? github : undefined
++  await shim('gh', agent ? run(agent.cli) : fail('gh is unavailable: this installation has no GitHub account.'))
+   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
+-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
++    await shim(name, fail(agent ? `${name} is blocked in this installation; use gh, which acts as ${agent.login}.` : `${name} is blocked in this installation.`))
+   }
+   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
+   await own(workerGitConfig(stateDir), [
+@@ -108,7 +110,8 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
+     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
+     '[user]', '\tuseConfigOnly = true',
+     '[credential]', '\thelper =',
+-    '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
++    ...agent ? ['[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(agent.cli))}`] : [],
++    // SSH addresses of github.com go over HTTPS, where only the agent's helper answers, so the operator's SSH keys never push there.
+     '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
+     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
+     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
+@@ -137,9 +140,11 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
+ /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
+ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+   const { github, stateDir } = deployment
++  // Without GitHub there is no helper to find; git must still read the isolated configuration, whose `user.useConfigOnly` shows it.
++  const [name, value] = github.cli ? ['credential.https://github.com.helper', credentialHelper(github.cli)] : ['user.useconfigonly', 'true']
+   // `-z` separates fields with NUL and never quotes paths.
+-  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
+-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
++  const found = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', name], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
++  if (found.join('\0') !== [`file:${workerGitConfig(stateDir)}`, value, ''].join('\0')) throw new SetupError('gitTooOld')
+ }
+ 
+ /**
+diff --git a/src/kv.ts b/src/kv.ts
+index e7ed695..0db9df3 100644
+--- a/src/kv.ts
++++ b/src/kv.ts
+@@ -55,4 +55,8 @@ export const KV = {
+   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
+     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
+     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
++  /** Inbox Source: the change time and size (`<mtimeMs>:<size>`) of each note when it was last read, by its absolute path. */
++  inbox: { seen: family<string, [file: string]>('inbox-seen:') },
++  /** Timer Source: the occurrence each schedule last started, or when it was first seen, as an ISO time, by schedule id. */
++  timer: { last: family<string, [schedule: string]>('timer-last:') },
+ }
+diff --git a/src/sources/cron.ts b/src/sources/cron.ts
+new file mode 100644
+index 0000000..ba77a6b
+--- /dev/null
++++ b/src/sources/cron.ts
+@@ -0,0 +1,63 @@
++/**
++ * Five-field cron expressions (minute hour day-of-month month day-of-week) on the host's local clock, and their occurrences.
++ * Fields take `*`, numbers, ranges `a-b`, steps `*\/n` and `a-b/n`, and lists `a,b`; `@hourly`, `@daily`, `@weekly`,
++ * `@monthly` and `@yearly` name the usual ones. As in cron, when both day fields are restricted, a day matching either counts.
++ */
++export interface Cron { minutes: Set<number>; hours: Set<number>; days: Set<number>; months: Set<number>; weekdays: Set<number>
++  anyDay: boolean; anyWeekday: boolean }
++const ALIASES: Readonly<Record<string, string>> = { '@hourly': '0 * * * *', '@daily': '0 0 * * *', '@midnight': '0 0 * * *',
++  '@weekly': '0 0 * * 0', '@monthly': '0 0 1 * *', '@yearly': '0 0 1 1 *', '@annually': '0 0 1 1 *' }
++function field(text: string, min: number, max: number, label: string): Set<number> {
++  const values = new Set<number>()
++  for (const part of text.split(',')) {
++    const match = /^(\*|(\d+)(?:-(\d+))?)(?:\/(\d+))?$/.exec(part)
++    if (!match) throw new Error(`The ${label} field "${text}" is not a cron field`)
++    const from = match[1] === '*' ? min : Number(match[2]), to = match[1] === '*' ? max : match[3] === undefined ? (match[4] ? max : from) : Number(match[3])
++    const step = match[4] === undefined ? 1 : Number(match[4])
++    if (from < min || to > max || from > to || step < 1) throw new Error(`The ${label} field "${text}" leaves ${min}-${max}`)
++    for (let value = from; value <= to; value += step) values.add(value)
++  }
++  return values
++}
++/** Parses a cron expression. @throws when it is not five valid fields or a known alias. */
++export function parseCron(expression: string): Cron {
++  const fields = (ALIASES[expression.trim().toLowerCase()] ?? expression).trim().split(/\s+/)
++  if (fields.length !== 5) throw new Error(`"${expression}" is not five cron fields: minute hour day month weekday`)
++  const [minute, hour, day, month, weekday] = fields as [string, string, string, string, string]
++  const weekdays = field(weekday, 0, 7, 'weekday')
++  // 7 names Sunday too.
++  if (weekdays.delete(7)) weekdays.add(0)
++  return { minutes: field(minute, 0, 59, 'minute'), hours: field(hour, 0, 23, 'hour'), days: field(day, 1, 31, 'day'),
++    months: field(month, 1, 12, 'month'), weekdays, anyDay: day === '*', anyWeekday: weekday === '*' }
++}
++export const validCron = (expression: string): boolean => { try { parseCron(expression); return true } catch { return false } }
++function dayMatches(cron: Cron, at: Date): boolean {
++  const day = cron.days.has(at.getDate()), weekday = cron.weekdays.has(at.getDay())
++  if (cron.anyDay && cron.anyWeekday) return true
++  if (cron.anyDay) return weekday
++  if (cron.anyWeekday) return day
++  return day || weekday
++}
++/** The first occurrence strictly after `after`, within `limitDays`; undefined when none falls in that window, as for 31 February. */
++export function nextAfter(cron: Cron, after: Date, limitDays = 400): Date | undefined {
++  const at = new Date(after.getTime())
++  at.setSeconds(0, 0)
++  at.setMinutes(at.getMinutes() + 1)
++  const end = after.getTime() + limitDays * 86_400_000
++  while (at.getTime() <= end) {
++    if (!cron.months.has(at.getMonth() + 1)) { at.setMonth(at.getMonth() + 1, 1); at.setHours(0, 0, 0, 0); continue }
++    if (!dayMatches(cron, at)) { at.setDate(at.getDate() + 1); at.setHours(0, 0, 0, 0); continue }
++    if (!cron.hours.has(at.getHours())) { at.setHours(at.getHours() + 1, 0, 0, 0); continue }
++    if (!cron.minutes.has(at.getMinutes())) { at.setMinutes(at.getMinutes() + 1, 0, 0); continue }
++    return at
++  }
++  return undefined
++}
++/** The latest occurrence after `since` and at or before `now`, so a host that was down runs a missed occurrence once, not each of them. */
++export function latestBetween(cron: Cron, since: Date, now: Date): Date | undefined {
++  let latest: Date | undefined
++  for (let next = nextAfter(cron, since), steps = 0; next && next.getTime() <= now.getTime() && steps < 100_000; next = nextAfter(cron, next), steps++) {
++    latest = next
++  }
++  return latest
++}
+diff --git a/src/sources/github.ts b/src/sources/github.ts
+index f9b80b6..08a1557 100644
+--- a/src/sources/github.ts
++++ b/src/sources/github.ts
+@@ -103,9 +103,9 @@ export const githubKind: SourceKind<GithubConfig> = {
+         DSH_SUPERAGENT_GITHUB_PR_HEAD: number && trigger?.meta.isPr === true ? `refs/pull/${number}/head` : '' }
+     },
+   },
+-  facts: (deployment): Record<string, Localized | string> => deployment ? {
++  facts: (deployment): Record<string, Localized | string> => !deployment ? {} : deployment.github.login ? {
+     cli: { zh: `当前账号 @${deployment.github.login}`, en: `Current account @${deployment.github.login}` },
+-  } : {},
++  } : { cli: { zh: '这个来源关着，没有解析 GitHub 账号', en: 'The Source is off; no GitHub account is resolved' } },
+ }
+ export const name = 'dsh-superagent-github'
+ export const inject = ['orchestrator']
+diff --git a/src/sources/inbox-note.ts b/src/sources/inbox-note.ts
+new file mode 100644
+index 0000000..e7ab083
+--- /dev/null
++++ b/src/sources/inbox-note.ts
+@@ -0,0 +1,69 @@
++/**
++ * The text of an inbox note: a front matter of `key: value` lines, then passages a person writes, between the agent's replies.
++ * A reply is a callout that starts with `> [!agent]` and carries a hidden `<!-- hq:<id> -->` marker, so a retried send finds it.
++ */
++import { localStamp } from './local-files.ts'
++/** One part of a note in document order: a passage a person wrote (`index` counts passages), or one of the agent's replies. */
++export interface NoteBlock { kind: 'person' | 'agent'; text: string; index: number; id?: string }
++export interface Note { head: Record<string, string>; blocks: NoteBlock[] }
++const AGENT = /^>\s*\[!agent\]/i
++const MARKER = /<!--\s*hq:([A-Za-z0-9_-]+)\s*-->/
++/** The marker a reply carries; a note that holds it has received that reply. */
++export const replyMarker = (id: string): string => `<!-- hq:${id} -->`
++const unquote = (value: string): string => /^(['"]).*\1$/.test(value) ? value.slice(1, -1) : value
++/** True for a front matter value that switches something on, such as `draft: true`. */
++export const yes = (value: string | undefined): boolean => /^(true|yes|on|1|是)$/i.test(value?.trim() ?? '')
++/** Splits a note into its front matter and its blocks. A passage without a letter or a digit, such as a rule (`---`), is no passage. */
++export function parseNote(source: string): Note {
++  let body = source.replace(/\r\n?/g, '\n').replace(/^\uFEFF/, '')
++  const head: Record<string, string> = {}
++  const front = /^---\n([\s\S]*?)\n---[ \t]*(?:\n|$)/.exec(body)
++  if (front) {
++    for (const line of front[1]!.split('\n')) {
++      const field = /^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/.exec(line)
++      if (field) head[field[1]!.toLowerCase()] = unquote(field[2]!.trim())
++    }
++    body = body.slice(front[0].length)
++  }
++  const blocks: NoteBlock[] = []
++  let person: string[] = [], agent: string[] | undefined, passages = 0
++  const flushPerson = (): void => {
++    const text = person.join('\n').trim()
++    person = []
++    if (/[\p{L}\p{N}]/u.test(text)) blocks.push({ kind: 'person', text, index: passages++ })
++  }
++  const flushAgent = (): void => {
++    if (!agent) return
++    const raw = agent.map(line => line.replace(/^>\s?/, '')).join('\n')
++    const id = MARKER.exec(raw)?.[1]
++    blocks.push({ kind: 'agent', text: raw.replace(MARKER, '').trim(), index: blocks.length, ...id ? { id } : {} })
++    agent = undefined
++  }
++  for (const line of body.split('\n')) {
++    if (agent) {
++      if (line.startsWith('>')) { agent.push(line); continue }
++      flushAgent()
++    }
++    if (AGENT.test(line)) { flushPerson(); agent = [line]; continue }
++    person.push(line)
++  }
++  flushAgent(); flushPerson()
++  return { head, blocks }
++}
++/** The title of a note: its front matter `title`, else the first heading of its first passage, else `fallback`. */
++export function noteTitle(note: Note, fallback: string): string {
++  const first = note.blocks.find(block => block.kind === 'person')?.text ?? ''
++  return note.head.title || /^#{1,6}\s+(.+)$/m.exec(first)?.[1]?.trim() || fallback
++}
++/**
++ * A reply as a callout to append to a note, with a blank line before and after it, so the next passage a person writes
++ * starts outside it.
++ */
++export function replyBlock(id: string, title: string, at: Date, text: string): string {
++  const lines = text.trim().split('\n').map(line => line.trim() ? `> ${line}` : '>')
++  return ['', `> [!agent] ${title} · ${localStamp(at)}`, ...lines, `> ${replyMarker(id)}`, '', ''].join('\n')
++}
++/** Titles of replies by the kind of message an Outbox sends. */
++export const REPLY_TITLES: Readonly<Record<'acknowledgement' | 'reply' | 'notice', string>> = {
++  acknowledgement: '已接单', reply: '回复', notice: '通知',
++}
+diff --git a/src/sources/inbox.ts b/src/sources/inbox.ts
+new file mode 100644
+index 0000000..18bba18
+--- /dev/null
++++ b/src/sources/inbox.ts
+@@ -0,0 +1,232 @@
++/**
++ * Inbox Source kind and plugin entry, exported as `./inbox-watch`: Markdown notes in one folder per business. Each note is a
++ * Thread, each passage its author writes there a Trigger, and the agent's messages are callouts appended to the same note.
++ */
++import type { Context } from '@deepseek-ai/cordis'
++import { readFile, stat } from 'node:fs/promises'
++import { basename, join } from 'node:path'
++import { z } from 'zod'
++import { key, threadKey, type OutboundMessage, type ThreadRef, type Trigger } from '../core/index.ts'
++import { KV } from '../kv.ts'
++import { health, sourceContext, type SourceContext } from './host.ts'
++import { noteTitle, parseNote, REPLY_TITLES, replyBlock, replyMarker, yes, type Note } from './inbox-note.ts'
++import type { ContextMessage, SourceKind } from './kind.ts'
++import { appendOnce, fileUrl, inside, listFiles } from './local-files.ts'
++import { pause } from './poll.ts'
++export const INBOX = 'inbox'
++/** A reply waits while its note changed this recently, so it does not land in the middle of what a person is typing. */
++const QUIET_MS = 3000
++const folderPath = z.string().trim().refine(value => !value.startsWith('/') && !value.split('/').some(part => part === '..' || part === '.'),
++  'A folder inside the inbox root')
++const Slug = z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/)
++const BusinessSchema = z.object({
++  id: Slug,
++  title: z.string().trim().max(60).default(''),
++  folder: folderPath.default(''),
++  type: z.string().trim().regex(/^([a-z0-9-]{1,30})?$/).default(''),
++  repo: z.string().trim().regex(/^(\/.*)?$/, 'An absolute path').default(''),
++}).strict()
++const InboxConfigSchema = z.object({
++  root: z.string().trim().regex(/^(\/.*)?$/, 'An absolute path').default(''),
++  owner: z.string().trim().regex(/^[A-Za-z0-9_.-]{1,40}$/).default('owner'),
++  businesses: z.array(BusinessSchema).default([]),
++  settleSeconds: z.number().int().min(0).max(600).default(15),
++  pollSeconds: z.number().int().min(2).max(600).default(5),
++}).strict()
++export type InboxConfig = z.infer<typeof InboxConfigSchema>
++export type InboxBusiness = InboxConfig['businesses'][number]
++/** The folder of a business, under the root. */
++export const businessFolder = (config: InboxConfig, business: InboxBusiness): string => join(config.root, business.folder || business.id)
++/** Where a note sits: its business, its absolute path, its path inside the business folder, and when it last changed. */
++export interface NotePlace { business: InboxBusiness; file: string; path: string; changed: number }
++/**
++ * The Triggers of a note: one per passage its author wrote. A passage's id derives from its text and how many identical
++ * passages come before it, so a re-read finds the same ids, an edited passage arrives as a new Trigger, and two equal short
++ * answers stay two.
++ */
++export function noteTriggers(note: Note, place: NotePlace, config: Pick<InboxConfig, 'owner'>): Trigger[] {
++  const stem = place.path.replace(/\.md$/i, '')
++  const thread: ThreadRef = { source: INBOX, id: `${place.business.id}/${stem}` }
++  const type = note.head.type || place.business.type
++  const repo = note.head.repo || place.business.repo
++  const title = noteTitle(note, basename(stem))
++  const seen = new Map<string, number>()
++  return note.blocks.filter(block => block.kind === 'person').map(block => {
++    const repeat = seen.get(block.text) ?? 0
++    seen.set(block.text, repeat + 1)
++    return {
++      id: key(INBOX, thread.id, block.text, String(repeat)),
++      source: INBOX, threads: [thread],
++      actor: { source: INBOX, id: config.owner }, human: true, addressed: 'direct' as const,
++      at: new Date(place.changed + block.index).toISOString(),
++      text: block.text,
++      channel: { source: INBOX, thread: threadKey(thread), address: { business: place.business.id, file: place.file, name: title } },
++      url: fileUrl(place.file),
++      meta: { business: place.business.id, file: place.file, path: place.path, index: block.index, title,
++        ...type ? { type } : {}, ...repo ? { repo } : {} },
++    }
++  })
++}
++/** Appends an Outbox message to its note as a callout, once; a note that no longer exists can never receive it. */
++export async function sendInbox(_host: unknown, message: OutboundMessage, now = Date.now()): Promise<'sent' | 'gone'> {
++  const file = message.channel.address.file
++  if (!file) throw new Error('An inbox reply names no note')
++  const changed = await stat(file).then(info => info.mtimeMs, () => undefined)
++  if (changed === undefined) return 'gone'
++  if (now - changed < QUIET_MS) throw new Error('The note changed a moment ago; the reply waits until it is quiet')
++  const done = await appendOnce(file, replyMarker(message.id), replyBlock(message.id, REPLY_TITLES[message.kind], new Date(now), message.text))
++  return done === 'missing' ? 'gone' : 'sent'
++}
++/** A note's blocks as the messages an assessment reads, in document order; the agent's replies count as a bot's. */
++export function noteMessages(note: Note, owner: string, at: string): ContextMessage[] {
++  return note.blocks.map(block => block.kind === 'person'
++    ? { id: `p${block.index}`, from: owner, at, text: block.text }
++    : { id: `a${block.index}`, from: 'agent', at, text: block.text, bot: true as const })
++}
++export const inboxKind: SourceKind<InboxConfig> = {
++  kind: INBOX,
++  title: { zh: '收件箱', en: 'Inbox' },
++  description: { zh: '每个业务一个文件夹的 Markdown 笔记：一篇笔记是一个线程，作者写的每一段是一条触发，智能体的消息追加在同一篇笔记末尾。', en: 'Markdown notes in one folder per business: a note is a Thread, each passage its author writes a Trigger, and the agent\'s messages are appended to the same note.' },
++  schema: InboxConfigSchema,
++  fields: [
++    { key: 'root', type: 'text', label: { zh: '收件箱根目录', en: 'Inbox root' },
++      hint: { zh: '绝对路径。每个业务在它下面有一个文件夹；名字以 _ 或 . 开头的文件夹和文件不读，例如 _done、_routines。', en: 'An absolute path. Each business has a folder under it; folders and files whose names start with _ or . are not read, such as _done and _routines.' } },
++    { key: 'owner', type: 'text', label: { zh: '笔记作者', en: 'Note author' },
++      hint: { zh: '笔记里人写的段落都记在这个 id 名下；策略的名单里写同一个 id，它写的每段才是明确的请求。', en: 'Passages people write in the notes are recorded under this id; list the same id in the Policy so each passage is an explicit request.' } },
++    { key: 'businesses', type: 'rows', label: { zh: '业务', en: 'Businesses' }, columns: [
++      { key: 'id', type: 'text', label: { zh: '业务 id', en: 'Business id' }, pattern: '[a-z0-9][a-z0-9\\-]*' },
++      { key: 'title', type: 'text', label: { zh: '名称', en: 'Title' }, optional: true },
++      { key: 'folder', type: 'text', label: { zh: '文件夹', en: 'Folder' }, optional: true },
++      { key: 'type', type: 'text', label: { zh: '默认类型', en: 'Default type' }, optional: true },
++      { key: 'repo', type: 'text', label: { zh: '默认仓库', en: 'Default repository' }, optional: true }] },
++    { key: 'settleSeconds', type: 'number', advanced: true, min: 0, max: 600, label: { zh: '笔记静止多少秒后再读', en: 'Seconds a note stays unchanged before it is read' },
++      hint: { zh: '编辑器边写边保存；笔记在这段时间里没有再变，才把新写的段落当作写完。', en: 'Editors save while a person types; a passage counts as written once the note stays unchanged this long.' } },
++    { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } }],
++  health: [INBOX],
++  scope: ({ meta }, config) => {
++    if (!config.root) return { listened: false, reason: 'inbox_unconfigured' }
++    const business = config.businesses.find(item => item.id === meta.business)
++    return business ? { listened: true, observed: false, row: business.id } : { listened: false, reason: 'business_not_listed' }
++  },
++  channel: {
++    allowed: (address, config) => config.businesses.some(item => item.id === address.business) && inside(config.root, address.file ?? ''),
++    send: (host, message) => sendInbox(host, message),
++    link: address => ({ url: fileUrl(address.file ?? ''), label: { zh: `收件箱笔记 ${address.name ?? ''}`.trim(), en: `Inbox note ${address.name ?? ''}`.trim() } }),
++  },
++  threadContext: {
++    messageId: trigger => `p${String(trigger.meta.index ?? 0)}`,
++    read: async (_commands, trigger, part, _cursor, config) => {
++      const note = parseNote(await readFile(String(trigger.meta.file ?? ''), 'utf8'))
++      const all = noteMessages(note, config.owner, trigger.at)
++      const own = all.findIndex(message => message.id === `p${String(trigger.meta.index ?? 0)}`)
++      const messages = part === 'root' ? all.slice(0, 1) : part === 'parent' ? own > 0 ? [all[own - 1]!] : [] : all
++      return { messages, body: { messages } }
++    },
++  },
++  find: query => ({ threads: /^inbox:\S+$/.test(query.trim()) ? [query.trim()] : [], terms: [] }),
++  policy: {
++    schema: z.object({ allowed: z.array(z.object({ id: z.string().regex(/^[A-Za-z0-9_.-]+$/), name: z.string().trim().max(100).optional() }).strict())
++      .default([]) }).strict(),
++    fields: [{ key: 'allowed', type: 'rows', label: { zh: '能发起工作的笔记作者', en: 'Note authors who may originate work' }, columns: [
++      { key: 'id', type: 'text', label: { zh: '作者 id', en: 'Author id' } },
++      { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }] }],
++    explicit: { zh: '名单里的作者在业务文件夹里写下一篇笔记，或在笔记里补写一段。', en: 'An author on the list writes a note in a business folder, or adds a passage to one.' },
++    rows: stored => {
++      const config = InboxConfigSchema.safeParse(stored)
++      return (config.success ? config.data.businesses : []).map(business => ({ id: business.id, label: business.title || business.id,
++        note: { zh: '每段都点名', en: 'Every passage addresses the agent' },
++        cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } }))
++    },
++  },
++  environment: {
++    variables: [
++      { key: 'DSH_SUPERAGENT_INBOX_BUSINESS', description: { zh: '接下工单的收件箱业务 id；工单不是从收件箱来的时为空', en: 'The inbox business that started the ticket; empty when it did not start in the inbox' } },
++      { key: 'DSH_SUPERAGENT_INBOX_NOTE', description: { zh: '接下工单的笔记的绝对路径；这张工单的消息都追加在它末尾', en: 'Absolute path of the note that started the ticket; the ticket\'s messages are appended to it' } },
++      { key: 'DSH_SUPERAGENT_INBOX_TYPE', description: { zh: '笔记或业务写明的工作类型，例如 research、code；没写时为空', en: 'The kind of work the note or its business names, such as research or code; empty when none is named' } },
++      { key: 'DSH_SUPERAGENT_INBOX_REPO', description: { zh: '笔记或业务写明的本地仓库绝对路径；没写时为空', en: 'Absolute path of the local repository the note or its business names; empty when none is named' } },
++    ],
++    values: ({ trigger }) => {
++      const text = (name: string): string => trigger?.source === INBOX && typeof trigger.meta[name] === 'string' ? trigger.meta[name] : ''
++      return { DSH_SUPERAGENT_INBOX_BUSINESS: text('business'), DSH_SUPERAGENT_INBOX_NOTE: text('file'), DSH_SUPERAGENT_INBOX_TYPE: text('type'),
++        DSH_SUPERAGENT_INBOX_REPO: text('repo') }
++    },
++  },
++}
++export const name = 'dsh-superagent-inbox'
++export const inject = ['orchestrator']
++export function apply(ctx: Context): void {
++  ctx.effect(() => ctx.orchestrator.sources.register(inboxKind), 'inbox: source kind')
++  ctx.effect(() => {
++    const source = sourceContext(ctx.orchestrator, inboxKind)
++    const controller = new AbortController()
++    // Unhandled rejections terminate the DSH process, so a failure escaping the polling loop is reported as source health instead.
++    const running = watch(source, controller.signal)
++      .catch((error: unknown) => { source.report(INBOX, { state: 'error', detail: String(error) }) })
++    return async () => { controller.abort(); await running }
++  })
++}
++async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
++  await ctx.ready
++  if (!ctx.configured()) { ctx.report(INBOX, health('paused', 'setupPending')); return }
++  let failures = 0
++  while (!signal.aborted) {
++    const config = ctx.config<InboxConfig>(INBOX)
++    const at = new Date().toISOString()
++    if (!config) ctx.report(INBOX, health('paused', 'sourceOff'))
++    else if (!config.root || !config.businesses.length) ctx.report(INBOX, { state: 'paused', detail: 'No inbox root or business is set', at })
++    else {
++      try {
++        const round = await scanInbox(ctx, config, signal)
++        failures = 0
++        ctx.report(INBOX, { state: 'ready', at, detail: `${round.notes} notes, ${round.received} new passages`
++          + `${round.settling ? `, ${round.settling} being written` : ''}${round.missing ? `, ${round.missing} business folders missing` : ''}` })
++      } catch (error) {
++        failures += 1
++        if (!signal.aborted && failures >= 3) ctx.report(INBOX, health('error', 'pollFailures', { count: String(failures), error: String(error) }))
++      }
++    }
++    await pause((config?.pollSeconds ?? 5) * 1000, signal)
++  }
++}
++export interface InboxRound { notes: number; received: number; settling: number; missing: number }
++/**
++ * Reads every changed, settled note of every business and hands its passages to the Engine; a note is remembered by its
++ * change time and size, so an unchanged note is not read again. A note marked `draft: true` waits until the mark goes.
++ */
++export async function scanInbox(ctx: SourceContext, config: InboxConfig, signal?: AbortSignal, now = Date.now()): Promise<InboxRound> {
++  const round: InboxRound = { notes: 0, received: 0, settling: 0, missing: 0 }
++  for (const business of config.businesses) {
++    const folder = businessFolder(config, business)
++    let paths: string[]
++    try { paths = await listFiles(folder, '.md') } catch (error) {
++      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { round.missing += 1; continue }
++      throw error
++    }
++    for (const path of paths) {
++      if (signal?.aborted) throw new Error('The inbox Source stopped during the read')
++      const file = join(folder, path)
++      const info = await stat(file).catch(() => undefined)
++      if (!info) continue
++      round.notes += 1
++      const seen = KV.inbox.seen(file), fingerprint = `${info.mtimeMs}:${info.size}`
++      if (ctx.state.get(seen) === fingerprint) continue
++      if (now - info.mtimeMs < config.settleSeconds * 1000) { round.settling += 1; continue }
++      const note = parseNote(await readFile(file, 'utf8'))
++      if (!yes(note.head.draft)) {
++        const triggers = noteTriggers(note, { business, file, path, changed: info.mtimeMs }, config)
++        for (const trigger of triggers) if (await ctx.receive(trigger) === 'stored') round.received += 1
++        const thread = triggers[0]?.threads[0]
++        if (thread) {
++          const type = note.head.type || business.type
++          ctx.threads.describe(threadKey(thread), { label: String(triggers[0]!.meta.title), url: fileUrl(file), facts: {
++            business: { label: { zh: '业务', en: 'Business' }, value: business.title || business.id },
++            type: type ? { label: { zh: '类型', en: 'Type' }, value: type } : null,
++            status: yes(note.head.done) || /^(done|closed|完成|已完成)$/i.test(note.head.status ?? '') ? { label: { zh: '笔记', en: 'Note' }, value: { zh: '已标记完成', en: 'Marked done' } } : null,
++          } })
++        }
++      }
++      ctx.state.set(seen, fingerprint)
++    }
++  }
++  return round
++}
+diff --git a/src/sources/local-files.ts b/src/sources/local-files.ts
+new file mode 100644
+index 0000000..4c0af2d
+--- /dev/null
++++ b/src/sources/local-files.ts
+@@ -0,0 +1,78 @@
++/** File helpers the local Sources (inbox, timer, spool) share: listing a folder, once-only appends, moves, and local timestamps. */
++import { appendFile, mkdir, readdir, readFile, rename, stat } from 'node:fs/promises'
++import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
++/** True for a name the local Sources leave alone: hidden (`.`) or reserved for their own records (`_`), such as `_done`. */
++export const reserved = (name: string): boolean => name.startsWith('.') || name.startsWith('_')
++/**
++ * Files under `root` whose names end with `extension`, as paths relative to it, oldest first by name; folders and files whose
++ * names start with `.` or `_` are skipped at every level. Stops after `limit` files.
++ * @throws the read error of `root` itself, such as ENOENT for a folder that does not exist yet.
++ */
++export async function listFiles(root: string, extension: string, limit = 5000): Promise<string[]> {
++  const found: string[] = []
++  const walk = async (dir: string): Promise<void> => {
++    const entries = await readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
++      if (dir === root) throw error
++      // A subfolder removed during the walk holds nothing to read.
++      return []
++    })
++    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
++      if (found.length >= limit) return
++      if (reserved(entry.name)) continue
++      const path = join(dir, entry.name)
++      if (entry.isDirectory()) await walk(path)
++      else if (entry.isFile() && extname(entry.name).toLowerCase() === extension) found.push(relative(root, path))
++    }
++  }
++  await walk(root)
++  return found
++}
++/** True when `path` is absolute and lies inside `root` once `..` is resolved, so an address names no file outside a Source's folder. */
++export function inside(root: string, path: string): boolean {
++  if (!root || !isAbsolute(path)) return false
++  const rest = relative(resolve(root), resolve(path))
++  return rest !== '' && !rest.startsWith('..') && !isAbsolute(rest) && !rest.split(sep).includes('..')
++}
++/**
++ * Appends `text` to `file` once: a file that already holds `marker` is left as it is, so a retried send writes nothing twice.
++ * A file that does not end with a line break gets one first.
++ */
++export async function appendOnce(file: string, marker: string, text: string): Promise<'appended' | 'present' | 'missing'> {
++  let current: string
++  try { current = await readFile(file, 'utf8') } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'
++    throw error
++  }
++  if (current.includes(marker)) return 'present'
++  await appendFile(file, `${current === '' || current.endsWith('\n') ? '' : '\n'}${text}`)
++  return 'appended'
++}
++/** Moves `file` into `dir`, created when missing, keeping its name; a name already taken there gets a numeric suffix. */
++export async function moveInto(file: string, dir: string): Promise<string> {
++  await mkdir(dir, { recursive: true })
++  const name = basename(file), extension = extname(name), stem = name.slice(0, name.length - extension.length)
++  for (let attempt = 0; ; attempt++) {
++    const target = join(dir, attempt ? `${stem}.${attempt}${extension}` : name)
++    const taken = await stat(target).then(() => true, () => false)
++    if (!taken) { await rename(file, target); return target }
++  }
++}
++/** The JSON value a file holds, or undefined when it cannot be read or is not JSON, so one bad file never fails a whole round. */
++export async function readJson(file: string): Promise<unknown> {
++  try { return JSON.parse(await readFile(file, 'utf8')) as unknown } catch { return undefined }
++}
++/** Milliseconds since `file` last changed, or undefined when it does not exist. */
++export async function age(file: string, now = Date.now()): Promise<number | undefined> {
++  return stat(file).then(info => now - info.mtimeMs, () => undefined)
++}
++const pad = (value: number): string => String(value).padStart(2, '0')
++/** A time as the host's local clock shows it, `YYYY-MM-DD HH:mm`, for text people read. */
++export function localStamp(at: Date): string {
++  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`
++}
++/** A time as a compact local name part, `YYYYMMDD-HHmm`, for ids and file names. */
++export function compactStamp(at: Date): string {
++  return `${at.getFullYear()}${pad(at.getMonth() + 1)}${pad(at.getDate())}-${pad(at.getHours())}${pad(at.getMinutes())}`
++}
++/** A `file://` address of an absolute path, for links people open. */
++export const fileUrl = (path: string): string => path ? `file://${encodeURI(path)}` : ''
+diff --git a/src/sources/spool.ts b/src/sources/spool.ts
+new file mode 100644
+index 0000000..bef56d4
+--- /dev/null
++++ b/src/sources/spool.ts
+@@ -0,0 +1,191 @@
++/**
++ * Spool Source kind and plugin entry, exported as `./spool-watch`: a local drop folder through which other programs, such as
++ * an automation, a chat bot or a monitor, hand the agent requests as JSON files, and read its replies as JSON files.
++ */
++import type { Context } from '@deepseek-ai/cordis'
++import { mkdir, readdir, writeFile } from 'node:fs/promises'
++import { join } from 'node:path'
++import { z } from 'zod'
++import { key, threadKey, type OutboundMessage, type Trigger } from '../core/index.ts'
++import { health, sourceContext, type SourceContext } from './host.ts'
++import type { SourceKind } from './kind.ts'
++import { fileUrl, inside, moveInto, readJson } from './local-files.ts'
++import { pause } from './poll.ts'
++export const SPOOL = 'spool'
++const Slug = z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/)
++const absolute = z.string().trim().regex(/^(\/.*)?$/, 'An absolute path')
++const SenderSchema = z.object({
++  id: Slug,
++  /** `person` for a program that relays what a person asked, whose messages may be explicit requests; `bot` for one acting on its own. */
++  kind: z.enum(['person', 'bot']).default('bot'),
++  business: z.string().trim().regex(/^([a-z0-9][a-z0-9-]*)?$/).default(''),
++}).strict()
++const SpoolConfigSchema = z.object({
++  inDir: absolute.default(''),
++  outDir: absolute.default(''),
++  senders: z.array(SenderSchema).default([]),
++  pollSeconds: z.number().int().min(2).max(600).default(5),
++}).strict()
++export type SpoolConfig = z.infer<typeof SpoolConfigSchema>
++export type SpoolSender = SpoolConfig['senders'][number]
++const Id = z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/)
++/** One request file as a program writes it. */
++export const SpoolMessageSchema = z.looseObject({
++  id: Id,
++  sender: z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/),
++  conversation: z.string().regex(/^[A-Za-z0-9_.-]{1,80}$/).default('default'),
++  thread: Id.optional(),
++  text: z.string().trim().min(1).max(20000),
++  business: z.string().regex(/^([a-z0-9][a-z0-9-]*)?$/).optional(),
++  type: z.string().regex(/^([a-z0-9-]{1,30})?$/).optional(),
++  repo: z.string().regex(/^(\/.*)?$/).optional(),
++  at: z.iso.datetime({ offset: true }).optional(),
++  addressed: z.boolean().default(true),
++  url: z.string().url().optional(),
++})
++export type SpoolMessage = z.infer<typeof SpoolMessageSchema>
++/** A request file as a Trigger. Its Thread is the conversation and the message that began the exchange, so later messages naming it follow up. */
++export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'kind' | 'business'>, outDir: string, now: Date): Trigger {
++  const root = message.thread ?? message.id
++  const thread = { source: SPOOL, id: `${message.conversation}/${root}` }
++  const person = sender.kind === 'person'
++  const business = message.business ?? sender.business
++  return {
++    id: key(SPOOL, message.sender, message.id), source: SPOOL, threads: [thread],
++    actor: { source: SPOOL, id: message.sender }, human: person,
++    ...message.addressed ? { addressed: person ? 'direct' as const : 'mention' as const } : {},
++    at: message.at ?? now.toISOString(), text: message.text,
++    channel: { source: SPOOL, thread: threadKey(thread), address: { conversation: message.conversation, root, message: message.id, sender: message.sender,
++      ...outDir ? { dir: join(outDir, message.conversation) } : {} } },
++    ...message.url ? { url: message.url } : {},
++    meta: { conversation: message.conversation, sender: message.sender, root, messageId: message.id, ...business ? { business } : {},
++      ...message.type ? { type: message.type } : {}, ...message.repo ? { repo: message.repo } : {} },
++  }
++}
++/** Writes a reply as `<outDir>/<conversation>/<message id>.json`, once; the program on the other side reads and removes it. */
++export async function sendSpool(_host: unknown, message: OutboundMessage, now = new Date()): Promise<'sent' | 'gone'> {
++  const { conversation, root, message: replyTo, dir } = message.channel.address
++  // A request received while no reply folder was set has nowhere to be answered.
++  if (!dir) return 'gone'
++  await mkdir(dir, { recursive: true })
++  const body = JSON.stringify({ id: message.id, kind: message.kind, conversation, thread: root, replyTo, ticket: message.ticketId ?? null,
++    text: message.text, at: now.toISOString() }, null, 2)
++  await writeFile(join(dir, `${message.id}.json`), `${body}\n`, { flag: 'wx' }).catch((error: unknown) => {
++    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
++  })
++  return 'sent'
++}
++export const spoolKind: SourceKind<SpoolConfig> = {
++    kind: SPOOL,
++    title: { zh: '投递目录', en: 'Spool' },
++    description: { zh: '本机程序把请求写成 JSON 文件放进收取目录，回复以 JSON 文件写进回复目录；发送者要在名单上。', en: 'Local programs drop requests as JSON files into the incoming folder and read replies as JSON files from the reply folder; senders must be listed.' },
++    schema: SpoolConfigSchema,
++    fields: [
++      { key: 'inDir', type: 'text', label: { zh: '收取目录', en: 'Incoming folder' }, hint: { zh: '绝对路径。读过的文件移进 .done，读不了的移进 .bad。', en: 'An absolute path. Read files move into .done, unreadable ones into .bad.' } },
++      { key: 'outDir', type: 'text', label: { zh: '回复目录', en: 'Reply folder' }, hint: { zh: '绝对路径。回复写成 <对话>/<消息 id>.json。', en: 'An absolute path. Replies are written as <conversation>/<message id>.json.' } },
++      { key: 'senders', type: 'rows', label: { zh: '发送者', en: 'Senders' }, columns: [
++        { key: 'id', type: 'text', label: { zh: '发送者 id', en: 'Sender id' }, pattern: '[a-z0-9][a-z0-9\\-]*' },
++        { key: 'kind', type: 'select', label: { zh: '代表', en: 'Acts for' }, options: [
++          { value: 'person', label: { zh: '转达人的请求', en: 'Relays a person' } }, { value: 'bot', label: { zh: '程序自己', en: 'Itself' } }] },
++        { key: 'business', type: 'text', label: { zh: '默认业务', en: 'Default business' }, optional: true }] },
++      { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } }],
++    health: [SPOOL],
++    scope: ({ meta }, config) => {
++      const sender = config.senders.find(item => item.id === meta.sender)
++      return sender ? { listened: true, observed: true, row: sender.id } : { listened: false, reason: 'sender_not_listed' }
++    },
++    channel: {
++      allowed: (address, config) => config.senders.some(item => item.id === address.sender) && (!address.dir || inside(config.outDir, address.dir)),
++      send: (host, message) => sendSpool(host, message),
++      link: address => ({ url: fileUrl(address.dir ?? ''),
++        label: { zh: `投递目录对话 ${address.conversation ?? ''}`.trim(), en: `Spool conversation ${address.conversation ?? ''}`.trim() } }),
++    },
++    find: query => ({ threads: /^spool:\S+$/.test(query.trim()) ? [query.trim()] : [], terms: [] }),
++    policy: {
++      schema: z.object({
++        allowed: z.array(z.object({ id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/), name: z.string().trim().max(100).optional() }).strict()).default([]),
++        bots: z.array(z.object({ id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/) }).strict()).optional(),
++      }).strict(),
++      fields: [
++        { key: 'allowed', type: 'rows', label: { zh: '能发起工作的发送者', en: 'Senders who may originate work' },
++          hint: { zh: '只对“转达人的请求”的发送者有效。', en: 'Applies to senders that relay a person.' },
++          columns: [{ key: 'id', type: 'text', label: { zh: '发送者 id', en: 'Sender id' } }, { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }] },
++        { key: 'bots', type: 'rows', label: { zh: '消息可以成为候选的程序', en: 'Programs whose messages may become candidates' },
++          hint: { zh: '“程序自己”的发送者在名单上时，它的消息成为推断的候选，按规则评估；它不能发起明确的请求。', en: 'A sender acting for itself on this list produces inferred candidates, assessed by the rules; it never makes an explicit request.' },
++          columns: [{ key: 'id', type: 'text', label: { zh: '发送者 id', en: 'Sender id' } }] }],
++      explicit: { zh: '名单里转达人的请求的发送者，消息里 addressed 为 true（默认）。', en: 'A listed sender that relays a person sends a message with addressed true, the default.' },
++      rows: stored => {
++        const config = SpoolConfigSchema.safeParse(stored)
++        return (config.success ? config.data.senders : []).map(sender => ({ id: sender.id, label: sender.id,
++          note: sender.kind === 'person' ? { zh: '转达人的请求', en: 'Relays a person' } : { zh: '程序自己', en: 'Itself' },
++          cells: { listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true } }))
++      },
++    },
++    environment: {
++      variables: [
++        { key: 'DSH_SUPERAGENT_SPOOL_SENDER', description: { zh: '接下工单的投递目录发送者；工单不是从投递目录来的时为空', en: 'The spool sender that started the ticket; empty when it did not start in the spool' } },
++        { key: 'DSH_SUPERAGENT_SPOOL_CONVERSATION', description: { zh: '接下工单的投递目录对话', en: 'The spool conversation that started the ticket' } },
++        { key: 'DSH_SUPERAGENT_SPOOL_BUSINESS', description: { zh: '请求或发送者写明的业务 id；没写时为空', en: 'The business the request or its sender names; empty when none is named' } },
++        { key: 'DSH_SUPERAGENT_SPOOL_TYPE', description: { zh: '请求写明的工作类型；没写时为空', en: 'The kind of work the request names; empty when none is named' } },
++        { key: 'DSH_SUPERAGENT_SPOOL_REPO', description: { zh: '请求写明的本地仓库绝对路径；没写时为空', en: 'Absolute path of the local repository the request names; empty when none is named' } },
++      ],
++      values: ({ trigger }) => {
++        const text = (name: string): string => trigger?.source === SPOOL && typeof trigger.meta[name] === 'string' ? trigger.meta[name] : ''
++        return { DSH_SUPERAGENT_SPOOL_SENDER: text('sender'), DSH_SUPERAGENT_SPOOL_CONVERSATION: text('conversation'), DSH_SUPERAGENT_SPOOL_BUSINESS: text('business'),
++          DSH_SUPERAGENT_SPOOL_TYPE: text('type'), DSH_SUPERAGENT_SPOOL_REPO: text('repo') }
++      },
++    },
++}
++export const name = 'dsh-superagent-spool'
++export const inject = ['orchestrator']
++export function apply(ctx: Context): void {
++  ctx.effect(() => ctx.orchestrator.sources.register(spoolKind), 'spool: source kind')
++  ctx.effect(() => {
++    const source = sourceContext(ctx.orchestrator, spoolKind)
++    const controller = new AbortController()
++    // Unhandled rejections terminate the DSH process, so a failure escaping the polling loop is reported as source health instead.
++    const running = watch(source, controller.signal)
++      .catch((error: unknown) => { source.report(SPOOL, { state: 'error', detail: String(error) }) })
++    return async () => { controller.abort(); await running }
++  })
++}
++async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
++  await ctx.ready
++  if (!ctx.configured()) { ctx.report(SPOOL, health('paused', 'setupPending')); return }
++  let failures = 0
++  while (!signal.aborted) {
++    const config = ctx.config<SpoolConfig>(SPOOL)
++    const at = new Date()
++    if (!config) ctx.report(SPOOL, health('paused', 'sourceOff'))
++    else if (!config.inDir) ctx.report(SPOOL, { state: 'paused', detail: 'No incoming folder is set', at: at.toISOString() })
++    else {
++      try {
++        const round = await readSpool(ctx, config, at)
++        failures = 0
++        ctx.report(SPOOL, { state: 'ready', at: at.toISOString(), detail: `${round.received} requests read${round.unreadable ? `, ${round.unreadable} unreadable` : ''}` })
++      } catch (error) {
++        failures += 1
++        if (!signal.aborted && failures >= 3) ctx.report(SPOOL, health('error', 'pollFailures', { count: String(failures), error: String(error) }))
++      }
++    }
++    await pause((config?.pollSeconds ?? 5) * 1000, signal)
++  }
++}
++/** Hands each request file to the Engine, then moves it into `.done`; a file that is not a request moves into `.bad`. */
++export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Date): Promise<{ received: number; unreadable: number }> {
++  const round = { received: 0, unreadable: 0 }
++  const names = await readdir(config.inDir).catch((error: unknown) => {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
++    throw error
++  })
++  for (const name of names.filter(item => item.endsWith('.json') && !item.startsWith('.')).sort()) {
++    const file = join(config.inDir, name)
++    const parsed = SpoolMessageSchema.safeParse(await readJson(file))
++    if (!parsed.success) { round.unreadable += 1; await moveInto(file, join(config.inDir, '.bad')); continue }
++    const sender = config.senders.find(item => item.id === parsed.data.sender) ?? { kind: 'bot' as const, business: '' }
++    // An unlisted sender's request is still received, so the panel shows it as filtered with the reason.
++    if (await ctx.receive(spoolTrigger(parsed.data, sender, config.outDir, now)) === 'stored') round.received += 1
++    await moveInto(file, join(config.inDir, '.done'))
++  }
++  return round
++}
+diff --git a/src/sources/timer.ts b/src/sources/timer.ts
+new file mode 100644
+index 0000000..0b042d7
+--- /dev/null
++++ b/src/sources/timer.ts
+@@ -0,0 +1,228 @@
++/**
++ * Timer Source kind and plugin entry, exported as `./timer-watch`. It brings time into the domain, as waiting conditions
++ * belong to Sources: each occurrence of a schedule is the operator's standing request on its own Thread, and a wake request a
++ * worker files continues its open ticket at a time, when a file appears, or at a deadline.
++ */
++import type { Context } from '@deepseek-ai/cordis'
++import { existsSync } from 'node:fs'
++import { mkdir, readdir, writeFile } from 'node:fs/promises'
++import { dirname, join } from 'node:path'
++import { z } from 'zod'
++import { key, liveTicket, threadKey, type OutboundMessage, type ThreadRef, type Trigger } from '../core/index.ts'
++import { KV } from '../kv.ts'
++import { latestBetween, parseCron, validCron } from './cron.ts'
++import { health, sourceContext, type SourceContext } from './host.ts'
++import { REPLY_TITLES, replyBlock, replyMarker } from './inbox-note.ts'
++import type { SourceKind } from './kind.ts'
++import { appendOnce, compactStamp, fileUrl, inside, localStamp, moveInto, readJson } from './local-files.ts'
++import { pause } from './poll.ts'
++export const TIMER = 'timer'
++/** The actor of each schedule occurrence: the operator, who wrote the schedule in the settings, which only the panel saves. */
++export const SCHEDULE_ACTOR = 'operator'
++const Slug = z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/)
++const absolute = z.string().trim().regex(/^(\/.*)?$/, 'An absolute path')
++const ScheduleSchema = z.object({
++  id: Slug,
++  cron: z.string().trim().refine(validCron, 'Five cron fields (minute hour day month weekday) or an alias such as @daily'),
++  business: z.string().trim().regex(/^([a-z0-9][a-z0-9-]*)?$/).default(''),
++  type: z.string().trim().regex(/^([a-z0-9-]{1,30})?$/).default(''),
++  text: z.string().trim().min(1).max(4000),
++  state: z.enum(['on', 'off']).default('on'),
++}).strict()
++const TimerConfigSchema = z.object({
++  schedules: z.array(ScheduleSchema).default([]),
++  wakeDir: absolute.default(''),
++  reportsDir: absolute.default(''),
++  pollSeconds: z.number().int().min(5).max(600).default(15),
++}).strict()
++export type TimerConfig = z.infer<typeof TimerConfigSchema>
++export type Schedule = TimerConfig['schedules'][number]
++/** A wake request: the open ticket to continue, and when: at a time, once a file exists, or at the latest at a deadline. */
++export const WakeSchema = z.object({
++  ticket: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
++  at: z.iso.datetime({ offset: true }).optional(),
++  whenExists: z.string().regex(/^\//).optional(),
++  deadline: z.iso.datetime({ offset: true }).optional(),
++  note: z.string().trim().max(2000).default(''),
++  created: z.iso.datetime({ offset: true }),
++}).strict().refine(request => request.at !== undefined || request.whenExists !== undefined, 'A wake request names a time or a file')
++export type WakeRequest = z.infer<typeof WakeSchema>
++/** Why a wake request is due now, or undefined while it waits. */
++export function wakeReason(request: WakeRequest, now: Date, exists: (file: string) => boolean = existsSync): 'time' | 'file' | 'deadline' | undefined {
++  if (request.whenExists && exists(request.whenExists)) return 'file'
++  if (request.at && Date.parse(request.at) <= now.getTime()) return 'time'
++  if (request.deadline && Date.parse(request.deadline) <= now.getTime()) return 'deadline'
++  return undefined
++}
++const REASON_TEXT = { time: '约定的时间到了', file: '等待的文件出现了', deadline: '等待到了截止时间' } as const
++/** The log file of a schedule's reports: one Markdown note per schedule, by business, under `reportsDir`. */
++export const reportFile = (config: Pick<TimerConfig, 'reportsDir'>, schedule: Pick<Schedule, 'id' | 'business'>): string =>
++  config.reportsDir ? join(config.reportsDir, schedule.business || 'general', `${schedule.id}.md`) : ''
++/** The Trigger of one occurrence: on a Thread of its own, so each occurrence is a new request rather than a follow-up of the last. */
++export function scheduleTrigger(schedule: Schedule, occurrence: Date, config: Pick<TimerConfig, 'reportsDir'>): Trigger {
++  const at = occurrence.toISOString()
++  const thread: ThreadRef = { source: TIMER, id: `run/${schedule.id}/${compactStamp(occurrence)}` }
++  const report = reportFile(config, schedule)
++  return {
++    id: key(TIMER, 'schedule', schedule.id, at), source: TIMER, threads: [thread],
++    actor: { source: TIMER, id: SCHEDULE_ACTOR }, human: true, addressed: 'direct', at,
++    text: `${schedule.text}\n\n（定时任务 ${schedule.id}，计划时间 ${localStamp(occurrence)}）`,
++    ...report ? { channel: { source: TIMER, thread: threadKey(thread), address: { file: report, schedule: schedule.id, business: schedule.business } } } : {},
++    meta: { kind: 'schedule', schedule: schedule.id, business: schedule.business, occurrence: at, ...schedule.type ? { type: schedule.type } : {},
++      ...report ? { report } : {} },
++  }
++}
++/**
++ * The Trigger that continues a ticket. It is a machine's, so the gate admits it nowhere and it never resumes an ended ticket; it
++ * sits on the ticket's wake Thread and on the Thread the ticket started on, which the ticket follows, so it reaches the ticket's
++ * worker as an Input whether or not the worker followed the wake Thread.
++ */
++export function wakeTrigger(request: WakeRequest, name: string, reason: keyof typeof REASON_TEXT, origin: ThreadRef | undefined, now: Date): Trigger {
++  const thread: ThreadRef = { source: TIMER, id: `wake/${request.ticket}` }
++  return {
++    id: key(TIMER, 'wake', name, request.created), source: TIMER, threads: origin ? [thread, origin] : [thread],
++    actor: { source: TIMER, id: 'clock' }, human: false, at: now.toISOString(),
++    text: `定时唤醒（${REASON_TEXT[reason]}）：${request.note || '按 STATE.md 继续这张工单。'}`,
++    meta: { kind: 'wake', ticket: request.ticket, reason, ...request.whenExists ? { file: request.whenExists } : {} },
++  }
++}
++/** Appends a report of a schedule's ticket to the schedule's log; a routine's acknowledgement would only be noise there. */
++export async function sendTimer(_host: unknown, message: OutboundMessage, now = new Date()): Promise<'sent' | 'gone'> {
++  if (message.kind === 'acknowledgement') return 'sent'
++  const { file, schedule } = message.channel.address
++  if (!file) throw new Error('A timer report names no log file')
++  await mkdir(dirname(file), { recursive: true })
++  await writeFile(file, `# 定时任务 ${schedule ?? ''}\n`, { flag: 'wx' }).catch((error: unknown) => {
++    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
++  })
++  await appendOnce(file, replyMarker(message.id), replyBlock(message.id, REPLY_TITLES[message.kind], now, message.text))
++  return 'sent'
++}
++export const timerKind: SourceKind<TimerConfig> = {
++  kind: TIMER,
++  title: { zh: '定时', en: 'Timer' },
++  description: { zh: '定时任务按计划成为请求，每次一个新线程；执行器登记的唤醒在约定时间、等待的文件出现或截止时间到时继续它的工单。', en: 'Schedules become requests on their plan, each occurrence on a new Thread; a wake request a worker files continues its ticket at a time, when a file appears, or at a deadline.' },
++  schema: TimerConfigSchema,
++  fields: [
++    { key: 'schedules', type: 'rows', label: { zh: '定时任务', en: 'Schedules' }, columns: [
++      { key: 'id', type: 'text', label: { zh: '任务 id', en: 'Schedule id' }, pattern: '[a-z0-9][a-z0-9\\-]*' },
++      { key: 'cron', type: 'text', label: { zh: '时间（cron）', en: 'When (cron)' } },
++      { key: 'business', type: 'text', label: { zh: '业务', en: 'Business' }, optional: true },
++      { key: 'type', type: 'text', label: { zh: '类型', en: 'Type' }, optional: true },
++      { key: 'text', type: 'text', label: { zh: '要做的事', en: 'Request' } },
++      { key: 'state', type: 'select', label: { zh: '状态', en: 'State' }, options: [
++        { value: 'on', label: { zh: '开', en: 'On' } }, { value: 'off', label: { zh: '关', en: 'Off' } }] }] },
++    { key: 'wakeDir', type: 'text', label: { zh: '唤醒请求目录', en: 'Wake request folder' },
++      hint: { zh: '绝对路径。执行器用 hq wake 在这里写 JSON 唤醒请求；处理过的移进 .done。', en: 'An absolute path. Workers file JSON wake requests here with hq wake; handled ones move into .done.' } },
++    { key: 'reportsDir', type: 'text', label: { zh: '定时任务记录目录', en: 'Schedule report folder' },
++      hint: { zh: '绝对路径。每个定时任务一篇记录笔记，按业务分文件夹；工单的回复追加在里面。', en: 'An absolute path. One log note per schedule, in a folder per business; its tickets\' replies are appended to it.' } },
++    { key: 'pollSeconds', type: 'number', advanced: true, min: 5, max: 600, label: { zh: '检查间隔 / 秒', en: 'Check interval / seconds' } }],
++  health: [TIMER],
++  scope: ({ meta }) => ({ listened: true, observed: false, row: meta.kind === 'wake' ? 'wake' : 'schedules' }),
++  channel: {
++    allowed: (address, config) => inside(config.reportsDir, address.file ?? ''),
++    send: (host, message) => sendTimer(host, message),
++    link: address => ({ url: fileUrl(address.file ?? ''), label: { zh: `定时任务记录 ${address.schedule ?? ''}`.trim(), en: `Schedule log ${address.schedule ?? ''}`.trim() } }),
++  },
++  find: query => ({ threads: /^timer:\S+$/.test(query.trim()) ? [query.trim()] : [], terms: [] }),
++  policy: {
++    schema: z.object({ allowed: z.array(z.object({ id: z.string().regex(/^[A-Za-z0-9_.-]+$/), name: z.string().trim().max(100).optional() }).strict())
++      .default([]) }).strict(),
++    fields: [{ key: 'allowed', type: 'rows', label: { zh: '能发起工作的定时任务作者', en: 'Schedule authors who may originate work' },
++      hint: { zh: `定时任务都记在 ${SCHEDULE_ACTOR} 名下；名单里有它，定时任务才会成为明确的请求。`, en: `Schedules are recorded under ${SCHEDULE_ACTOR}; with it on the list, each occurrence is an explicit request.` },
++      columns: [{ key: 'id', type: 'text', label: { zh: 'id', en: 'id' } }, { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }] }],
++    explicit: { zh: '定时任务到了计划时间。', en: 'A schedule reaches its planned time.' },
++    rows: () => [
++      { id: 'schedules', label: { zh: '定时任务', en: 'Schedules' }, note: { zh: '每次都点名', en: 'Each occurrence addresses the agent' },
++        cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false } },
++      { id: 'wake', label: { zh: '工单唤醒', en: 'Ticket wakes' }, note: { zh: '只送给它的工单', en: 'Reaches only its ticket' },
++        cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false } }],
++  },
++  environment: {
++    variables: [
++      { key: 'DSH_SUPERAGENT_TIMER_SCHEDULE', description: { zh: '接下工单的定时任务 id；工单不是定时任务开的时为空', en: 'The schedule that started the ticket; empty when no schedule started it' } },
++      { key: 'DSH_SUPERAGENT_TIMER_BUSINESS', description: { zh: '定时任务写明的业务 id；没写或不是定时任务时为空', en: 'The business the schedule names; empty when none is named or no schedule started the ticket' } },
++      { key: 'DSH_SUPERAGENT_TIMER_TYPE', description: { zh: '定时任务写明的工作类型；没写时为空', en: 'The kind of work the schedule names; empty when none is named' } },
++      { key: 'DSH_SUPERAGENT_TIMER_REPORT', description: { zh: '定时任务的记录笔记，这张工单的回复追加在里面；没有时为空', en: 'The schedule\'s log note, which this ticket\'s replies are appended to; empty when there is none' } },
++    ],
++    values: ({ trigger }) => {
++      const text = (name: string): string => trigger?.source === TIMER && trigger.meta.kind === 'schedule' && typeof trigger.meta[name] === 'string' ? trigger.meta[name] : ''
++      return { DSH_SUPERAGENT_TIMER_SCHEDULE: text('schedule'), DSH_SUPERAGENT_TIMER_BUSINESS: text('business'), DSH_SUPERAGENT_TIMER_TYPE: text('type'),
++        DSH_SUPERAGENT_TIMER_REPORT: text('report') }
++    },
++  },
++}
++export const name = 'dsh-superagent-timer'
++export const inject = ['orchestrator']
++export function apply(ctx: Context): void {
++  ctx.effect(() => ctx.orchestrator.sources.register(timerKind), 'timer: source kind')
++  ctx.effect(() => {
++    const source = sourceContext(ctx.orchestrator, timerKind)
++    const controller = new AbortController()
++    // Unhandled rejections terminate the DSH process, so a failure escaping the loop is reported as source health instead.
++    const running = watch(source, controller.signal)
++      .catch((error: unknown) => { source.report(TIMER, { state: 'error', detail: String(error) }) })
++    return async () => { controller.abort(); await running }
++  })
++}
++async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
++  await ctx.ready
++  if (!ctx.configured()) { ctx.report(TIMER, health('paused', 'setupPending')); return }
++  let failures = 0
++  while (!signal.aborted) {
++    const config = ctx.config<TimerConfig>(TIMER)
++    const at = new Date()
++    if (!config) ctx.report(TIMER, health('paused', 'sourceOff'))
++    else {
++      try {
++        const due = await timerRound(ctx, config, at)
++        failures = 0
++        ctx.report(TIMER, { state: 'ready', at: at.toISOString(), detail: `${config.schedules.filter(item => item.state === 'on').length} schedules on, `
++          + `${due.started} started, ${due.waiting} wake requests waiting, ${due.woken} woken` })
++      } catch (error) {
++        failures += 1
++        if (!signal.aborted && failures >= 3) ctx.report(TIMER, health('error', 'pollFailures', { count: String(failures), error: String(error) }))
++      }
++    }
++    await pause((config?.pollSeconds ?? 15) * 1000, signal)
++  }
++}
++export interface TimerRound { started: number; waiting: number; woken: number }
++/**
++ * One check: starts each schedule whose occurrence passed since the last one it started, and wakes the tickets whose wake
++ * requests are due. A schedule seen for the first time starts counting from now, so adding one never runs it at once.
++ */
++export async function timerRound(ctx: SourceContext, config: TimerConfig, now: Date): Promise<TimerRound> {
++  const round: TimerRound = { started: 0, waiting: 0, woken: 0 }
++  for (const schedule of config.schedules) {
++    if (schedule.state === 'off') continue
++    const last = KV.timer.last(schedule.id)
++    const since = ctx.state.get(last)
++    if (!since) { ctx.state.set(last, now.toISOString()); continue }
++    const occurrence = latestBetween(parseCron(schedule.cron), new Date(since), now)
++    if (!occurrence) continue
++    if (await ctx.receive(scheduleTrigger(schedule, occurrence, config)) === 'stored') round.started += 1
++    ctx.state.set(last, occurrence.toISOString())
++  }
++  if (!config.wakeDir) return round
++  const names = await readdir(config.wakeDir).catch((error: unknown) => {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
++    throw error
++  })
++  for (const name of names.filter(item => item.endsWith('.json') && !item.startsWith('.')).sort()) {
++    const file = join(config.wakeDir, name)
++    const parsed = WakeSchema.safeParse(await readJson(file))
++    if (!parsed.success) { await moveInto(file, join(config.wakeDir, '.bad')); continue }
++    const request = parsed.data
++    const ticket = ctx.tickets.get(request.ticket)
++    // An ended or unknown ticket has nothing to continue; a machine's Trigger would not resume it anyway.
++    if (!ticket || !liveTicket(ticket)) { await moveInto(file, join(config.wakeDir, '.done')); continue }
++    const reason = wakeReason(request, now)
++    if (!reason) { round.waiting += 1; continue }
++    const origin = ctx.triggers.get(ticket.origin.triggerId)?.threads[0]
++    await ctx.receive(wakeTrigger(request, name, reason, origin, now))
++    await moveInto(file, join(config.wakeDir, '.done'))
++    round.woken += 1
++  }
++  return round
++}
+diff --git a/tests/bundle-patch.spec.ts b/tests/bundle-patch.spec.ts
+index 33c027a..cc92c42 100644
+--- a/tests/bundle-patch.spec.ts
++++ b/tests/bundle-patch.spec.ts
+@@ -28,8 +28,8 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
+ 
+ it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
+   const rows = await patched()
+-  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
+-    'dsh-superagent-router-preset'])
++  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-inbox',
++    'dsh-superagent-timer', 'dsh-superagent-spool', 'dsh-superagent-worker-preset', 'dsh-superagent-router-preset'])
+   const preset = presetOf(rows, WORKER_PRESET)
+   expect(preset.id).toBe(WORKER_PRESET)
+   const plugins = flat(preset.plugins)
+diff --git a/tests/deployment.spec.ts b/tests/deployment.spec.ts
+index 532b40b..606750d 100644
+--- a/tests/deployment.spec.ts
++++ b/tests/deployment.spec.ts
+@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { promisify } from 'node:util'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
++import { Config, executable, githubWanted, hasGithub, machineOf, resolveDeployment, resolveFeishuBot, withoutGithub, type Machine, type Probe }
++  from '../src/deployment.ts'
+ import { gitEnv } from './fixtures/git.ts'
+ 
+ const exec = promisify(execFile)
+@@ -65,6 +66,14 @@ describe('setup', () => {
+     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
+     expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+   })
++  it('resolves GitHub unless its Source is switched off, which leaves the installation without a GitHub account', () => {
++    expect(githubWanted({ sources: {} })).toBe(true)
++    expect(githubWanted({ sources: { github: { enabled: true } } })).toBe(true)
++    expect(githubWanted({ sources: { github: { enabled: false } } })).toBe(false)
++    const deployment = withoutGithub(machine())
++    expect(deployment).toMatchObject({ repository: '', github: { cli: '', login: '', noreply: '' }, stateDir: join(dir, 'state') })
++    expect(hasGithub(deployment)).toBe(false)
++  })
+   it('names what setup needs and where it is set', async () => {
+     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
+       expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
+diff --git a/tests/environment.spec.ts b/tests/environment.spec.ts
+index db2bf3e..aec7a61 100644
+--- a/tests/environment.spec.ts
++++ b/tests/environment.spec.ts
+@@ -5,8 +5,10 @@ import { join } from 'node:path'
+ import { promisify } from 'node:util'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+-  from '../src/infra/environment.ts'
++import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig,
++  writeEnvironment } from '../src/infra/environment.ts'
++import { withoutGithub } from '../src/deployment.ts'
++import { testMachine } from './fixtures/deployment.ts'
+ import { CliError } from '../src/infra/commands.ts'
+ import { testDeployment } from './fixtures/deployment.ts'
+ import { gitEnv } from './fixtures/git.ts'
+@@ -38,6 +40,12 @@ describe('worker shims', () => {
+     await expect(exec(join(bin, 'lark-cli'), ['im', '+chat-list'])).rejects.toMatchObject({ code: 1, stderr: 'lark-cli is unavailable: this installation has no Feishu bot.\n' })
+     await expect(exec(join(bin, 'personal-gh'), [])).rejects.toMatchObject({ code: 1, stderr: 'personal-gh is blocked in this installation; use gh, which acts as agent-bot.\n' })
+   })
++  it('make `gh` fail without a GitHub account, and each blocked command fail without naming one', async () => {
++    await writeEnvironment(withoutGithub(testMachine({ stateDir: dir })), ['personal-gh'])
++    const bin = workerBin(dir)
++    await expect(exec(join(bin, 'gh'), ['api', 'user'])).rejects.toMatchObject({ code: 1, stderr: 'gh is unavailable: this installation has no GitHub account.\n' })
++    await expect(exec(join(bin, 'personal-gh'), [])).rejects.toMatchObject({ code: 1, stderr: 'personal-gh is blocked in this installation.\n' })
++  })
+   it('keep `gh` and `lark-cli` working, and shim no `git`, when the blocked commands name the commands workers need', async () => {
+     const gh = program(join(dir, 'gh-agent'), 'echo gh "$@"'), lark = program(join(dir, 'lark-bot'), 'echo lark "$@"')
+     const base = testDeployment()
+@@ -96,6 +104,23 @@ describe('agent git configuration', () => {
+   })
+ })
+ 
++describe('agent git configuration without GitHub', () => {
++  it('keeps no credential helper for github.com, sends its SSH addresses over HTTPS, and passes the setup check', async () => {
++    const home = join(dir, 'home'); mkdirSync(home)
++    writeFileSync(join(home, '.gitconfig'), '[credential]\n\thelper = osxkeychain\n')
++    await writeEnvironment(withoutGithub(testMachine({ stateDir: dir })), [])
++    const env = workerEnv({ PATH: process.env.PATH, HOME: home, ...agentVariables(dir) })
++    const git = async (...args: string[]): Promise<string> => (await exec('git', args, { cwd: dir, env })).stdout.trim()
++    await git('init', '-q', 'repo')
++    await git('-C', 'repo', 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git')
++    expect(await git('-C', 'repo', 'remote', 'get-url', '--push', 'origin')).toBe('https://github.com/acme/widgets.git')
++    await expect(git('config', '--get-all', 'credential.https://github.com.helper')).rejects.toThrow()
++    expect(await git('config', '--get-all', 'credential.helper')).toBe('')
++    expect(await git('config', '--show-origin', 'user.useconfigonly')).toBe(`file:${workerGitConfig(dir)}\ttrue`)
++    await expect(verifyEnvironment(withoutGithub(testMachine({ stateDir: dir })), subprocess(workerGitConfig(dir)), new AbortController().signal))
++      .resolves.toBeUndefined()
++  })
++})
+ it('fails instead of asking the operator\'s askpass helpers when the agent\'s credential helper has no answer', async () => {
+   const log = join(dir, 'asked')
+   const askpass = program(join(dir, 'askpass'), `echo asked >> ${log}; echo operator-secret`)
+diff --git a/tests/fixtures/local-sources.ts b/tests/fixtures/local-sources.ts
+new file mode 100644
+index 0000000..411b940
+--- /dev/null
++++ b/tests/fixtures/local-sources.ts
+@@ -0,0 +1,47 @@
++/** A Store, Engine and Source context for the local Sources' tests (inbox, timer, spool), with stand-in ports. */
++import { mkdtempSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { vi } from 'vitest'
++import { Engine, type Assessor, type Executor, type Ticket, type Trigger } from '../../src/core/index.ts'
++import { Store } from '../../src/app/store.ts'
++import { sourceContextOf, type SourceContextDeps } from '../../src/app/source-context.ts'
++import { Commands } from '../../src/infra/commands.ts'
++import { HealthBoard } from '../../src/infra/health.ts'
++import { SettingsSchema, settingsPolicy } from '../../src/policy.ts'
++import type { SourceKind } from '../../src/sources/kind.ts'
++import { SourceRegistry } from '../../src/sources/registry.ts'
++import { testDeployment } from './deployment.ts'
++/** Builds the parts with `settings` saved, registers `kinds`, and returns a context for the first kind. */
++export function localHost(kinds: SourceKind[], settings: Record<string, unknown>) {
++  const dir = mkdtempSync(join(tmpdir(), 'local-sources-'))
++  const store = new Store(join(dir, 'db.sqlite'))
++  store.saveSettings(SettingsSchema.parse(settings))
++  const board = new HealthBoard()
++  const sources = new SourceRegistry(() => store.settings(), board)
++  for (const kind of kinds) sources.register(kind)
++  const assessor: Assessor = { request: vi.fn(async () => {}) }
++  const executor: Executor = { start: vi.fn(async () => {}), deliver: vi.fn(async () => {}), stop: vi.fn(async () => {}) }
++  const engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources), assessor, executor,
++    outbox: { send: () => {}, status: () => undefined, withdraw: () => {} } })
++  const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
++  const receive = vi.fn(async (trigger: Trigger) => { const result = engine.receive(trigger); engine.evaluateDue(); return result })
++  const deps: SourceContextDeps = { store, engine, outbox: { send: message => { store.receipts.add(message) } }, commands, sources,
++    deployment: testDeployment(), ready: Promise.resolve(), configured: () => true, receive }
++  const ctx = sourceContextOf(deps, kinds[0]!)
++  return { dir, store, engine, sources, receive, executor, assessor, ctx, health: board.all }
++}
++/** An open ticket that started from `origin`, saved with a Subscription to that Trigger's first Thread. */
++export function openTicket(store: Store, id: string, origin: Trigger): Ticket {
++  const ticket: Ticket = { id, title: id, decisionId: `d-${id}`, mandate: { strength: 'explicit', policyVersion: '',
++    basis: { source: origin.source, scope: origin.meta, via: 'addressed', addressed: 'direct' },
++    actor: origin.actor, scope: '' }, channels: origin.channel ? [origin.channel] : [], assignments: [], inputs: [], undelivered: [],
++    createdAt: origin.at, updatedAt: origin.at, origin: { triggerId: origin.id, triggerIds: [origin.id] } }
++  store.atomic(() => {
++    store.triggers.save(origin)
++    store.tickets.save(ticket)
++    const ref = origin.threads[0]!
++    store.threads.save({ key: `${ref.source}:${ref.id}`, ref, createdAt: origin.at, subscriptions: [id], correlated: [], pending: [], meta: {} })
++  })
++  return ticket
++}
+diff --git a/tests/inbox.spec.ts b/tests/inbox.spec.ts
+new file mode 100644
+index 0000000..bd12aac
+--- /dev/null
++++ b/tests/inbox.spec.ts
+@@ -0,0 +1,121 @@
++import { mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import { threadKey, type OutboundMessage } from '../src/core/index.ts'
++import { KV } from '../src/kv.ts'
++import { inboxKind, noteTriggers, scanInbox, sendInbox, type InboxConfig } from '../src/sources/inbox.ts'
++import { parseNote, replyBlock } from '../src/sources/inbox-note.ts'
++import { inside, listFiles } from '../src/sources/local-files.ts'
++import { localHost } from './fixtures/local-sources.ts'
++const hosts: ReturnType<typeof localHost>[] = []
++afterEach(() => { for (const h of hosts.splice(0)) { h.store.close(); rmSync(h.dir, { recursive: true, force: true }) } })
++const business = { id: 'research', title: '调研', folder: '', type: 'research', repo: '' }
++function host(overrides: Partial<InboxConfig> = {}) {
++  const h = localHost([inboxKind], {})
++  const config: InboxConfig = { root: join(h.dir, 'inbox'), owner: 'alice', businesses: [business], settleSeconds: 15, pollSeconds: 5, ...overrides }
++  h.store.saveSettings({ ...h.store.settings(), sources: { inbox: { enabled: true, config } },
++    policy: { ...h.store.settings().policy, sources: { inbox: { allowed: [{ id: 'alice' }] } } } })
++  mkdirSync(join(config.root, 'research'), { recursive: true })
++  hosts.push(h)
++  return { ...h, config }
++}
++/** Writes a note and dates it `secondsAgo` in the past, so it counts as settled or as still being written. */
++function note(file: string, text: string, secondsAgo = 60): void {
++  mkdirSync(join(file, '..'), { recursive: true })
++  writeFileSync(file, text)
++  const at = new Date(Date.now() - secondsAgo * 1000)
++  utimesSync(file, at, at)
++}
++describe('an inbox note', () => {
++  it('splits into front matter, the passages a person wrote and the agent\'s replies', () => {
++    const parsed = parseNote(`---\ntype: code\nrepo: "/src/widgets"\ndraft: false\n---\n# 修复登录\n先看日志。\n\n---\n${replyBlock('m1', '已接单', new Date(), '收到，\n\n先复现。')}再补一句。\n`)
++    expect(parsed.head).toEqual({ type: 'code', repo: '/src/widgets', draft: 'false' })
++    expect(parsed.blocks.map(({ kind, text, index, id }) => ({ kind, text, index, ...id ? { id } : {} }))).toEqual([
++      { kind: 'person', text: '# 修复登录\n先看日志。\n\n---', index: 0 },
++      { kind: 'agent', text: expect.stringContaining('收到，\n\n先复现。'), index: 1, id: 'm1' },
++      { kind: 'person', text: '再补一句。', index: 1 }])
++  })
++  it('gives each passage a Trigger whose id survives a re-read, changes with an edit, and keeps two equal answers apart', () => {
++    const place = { business, file: '/inbox/research/a.md', path: 'a.md', changed: Date.parse('2026-11-01T00:00:00Z') }
++    const first = noteTriggers(parseNote(`做调研\n${replyBlock('m1', '回复', new Date(), '要哪几家？')}好\n${replyBlock('m2', '回复', new Date(), '还有吗？')}好\n`), place, { owner: 'alice' })
++    expect(first.map(trigger => trigger.text)).toEqual(['做调研', '好', '好'])
++    expect(new Set(first.map(trigger => trigger.id)).size).toBe(3)
++    expect(noteTriggers(parseNote(`做调研\n${replyBlock('m1', '回复', new Date(), '要哪几家？')}好\n`), place, { owner: 'alice' }).map(trigger => trigger.id))
++      .toEqual(first.slice(0, 2).map(trigger => trigger.id))
++    expect(noteTriggers(parseNote('做竞品调研'), place, { owner: 'alice' })[0]!.id).not.toBe(first[0]!.id)
++    expect(first[0]).toMatchObject({ source: 'inbox', threads: [{ source: 'inbox', id: 'research/a' }], actor: { source: 'inbox', id: 'alice' }, human: true,
++      addressed: 'direct', channel: { source: 'inbox', thread: 'inbox:research/a', address: { business: 'research', file: '/inbox/research/a.md' } },
++      meta: { business: 'research', file: '/inbox/research/a.md', path: 'a.md', type: 'research', title: 'a' } })
++  })
++})
++describe('the inbox Source', () => {
++  it('takes in a settled note as an explicit request, once, and leaves a note that is still being written for later', async () => {
++    const h = host()
++    const file = join(h.config.root, 'research', '竞品.md')
++    note(file, '# 竞品调研\n调研三家，周五前给结论。', 3)
++    expect(await scanInbox(h.ctx, h.config)).toMatchObject({ notes: 1, received: 0, settling: 1 })
++    utimesSync(file, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
++    expect(await scanInbox(h.ctx, h.config)).toMatchObject({ notes: 1, received: 1, settling: 0 })
++    const [trigger] = noteTriggers(parseNote(readFileSync(file, 'utf8')), { business, file, path: '竞品.md', changed: 0 }, h.config)
++    expect(h.engine.candidate(trigger!.id)?.strength).toBe('explicit')
++    expect(h.store.threads.get('inbox:research/竞品')?.meta).toMatchObject({ label: '竞品调研' })
++    // An unchanged note is not read again; a changed one is, and only its new passage is new.
++    expect(h.ctx.state.get(KV.inbox.seen(file))).toMatch(/^\d+(\.\d+)?:\d+$/)
++    expect(await scanInbox(h.ctx, h.config)).toMatchObject({ received: 0 })
++    note(file, `${readFileSync(file, 'utf8')}\n${replyBlock('m1', '已接单', new Date(), '收到。')}再加一家。\n`)
++    expect(await scanInbox(h.ctx, h.config)).toMatchObject({ received: 1 })
++  })
++  it('skips drafts, reserved folders and files, and counts a business whose folder is missing', async () => {
++    const h = host({ businesses: [business, { id: 'ops', title: '', folder: 'ops-folder', type: '', repo: '' }] })
++    note(join(h.config.root, 'research', 'draft.md'), '---\ndraft: true\n---\n还没写完')
++    note(join(h.config.root, 'research', '_done', 'old.md'), '旧的')
++    note(join(h.config.root, 'research', '_routines', 'daily.md'), '记录')
++    note(join(h.config.root, 'research', '.hidden.md'), '隐藏')
++    expect(await scanInbox(h.ctx, h.config)).toEqual({ notes: 1, received: 0, settling: 0, missing: 1 })
++    expect(await listFiles(join(h.config.root, 'research'), '.md')).toEqual(['draft.md'])
++  })
++  it('filters a note of a business the inbox does not list, and listens only while it has a root', () => {
++    const h = host()
++    expect(inboxKind.scope!({ meta: { business: 'sales' } }, h.config)).toEqual({ listened: false, reason: 'business_not_listed' })
++    expect(inboxKind.scope!({ meta: { business: 'research' } }, h.config)).toEqual({ listened: true, observed: false, row: 'research' })
++    expect(inboxKind.scope!({ meta: { business: 'research' } }, { ...h.config, root: '' })).toEqual({ listened: false, reason: 'inbox_unconfigured' })
++  })
++  it('names the note, its business, type and repository to the Executor', () => {
++    const h = host()
++    const [trigger] = noteTriggers(parseNote('---\nrepo: /src/app\n---\n改一下'), { business, file: '/inbox/research/x.md', path: 'x.md', changed: 0 }, h.config)
++    expect(inboxKind.environment!.values({ deployment: undefined as never, config: h.config, trigger })).toEqual({ DSH_SUPERAGENT_INBOX_BUSINESS: 'research',
++      DSH_SUPERAGENT_INBOX_NOTE: '/inbox/research/x.md', DSH_SUPERAGENT_INBOX_TYPE: 'research', DSH_SUPERAGENT_INBOX_REPO: '/src/app' })
++    expect(inboxKind.environment!.values({ deployment: undefined as never, config: h.config })).toMatchObject({ DSH_SUPERAGENT_INBOX_NOTE: '' })
++  })
++})
++describe('inbox replies', () => {
++  const message = (file: string, id = 'r1'): OutboundMessage => ({ id, kind: 'reply', text: '结果在 outputs/report.md。', ticketId: 't1',
++    channel: { source: 'inbox', thread: threadKey({ source: 'inbox', id: 'research/a' }), address: { business: 'research', file, name: 'a' } } })
++  it('append a callout once, which the note reads back as the agent\'s and not as a passage', async () => {
++    const h = host()
++    const file = join(h.config.root, 'research', 'a.md')
++    note(file, '做调研')
++    expect(await sendInbox(undefined, message(file))).toBe('sent')
++    note(file, readFileSync(file, 'utf8'))
++    expect(await sendInbox(undefined, message(file))).toBe('sent')
++    const text = readFileSync(file, 'utf8')
++    expect(text.match(/hq:r1/g)).toHaveLength(1)
++    expect(parseNote(text).blocks.map(block => block.kind)).toEqual(['person', 'agent'])
++  })
++  it('wait while the note changed a moment ago, and are gone once the note is', async () => {
++    const h = host()
++    const file = join(h.config.root, 'research', 'a.md')
++    note(file, '做调研', 0)
++    await expect(sendInbox(undefined, message(file))).rejects.toThrow('changed a moment ago')
++    expect(await sendInbox(undefined, message(join(h.config.root, 'research', 'gone.md')))).toBe('gone')
++  })
++  it('go only to a note inside the root, of a listed business', () => {
++    const h = host()
++    const allowed = inboxKind.channel!.allowed!
++    expect(allowed({ business: 'research', file: join(h.config.root, 'research', 'a.md') }, h.config)).toBe(true)
++    expect(allowed({ business: 'research', file: join(h.config.root, '..', 'elsewhere.md') }, h.config)).toBe(false)
++    expect(allowed({ business: 'sales', file: join(h.config.root, 'research', 'a.md') }, h.config)).toBe(false)
++    expect(inside('/a/b', '/a/b/c/../d.md')).toBe(true)
++    expect(inside('/a/b', '/a/bc/d.md')).toBe(false)
++  })
++})
+diff --git a/tests/runtime-concurrency.spec.ts b/tests/runtime-concurrency.spec.ts
+index 1a7eac3..a530536 100644
+--- a/tests/runtime-concurrency.spec.ts
++++ b/tests/runtime-concurrency.spec.ts
+@@ -790,10 +790,13 @@ it('wakes an idle worker for a status request in the slot kept for a person, whi
+ })
+ it('tells a passing failure of the provider or the network from one that a later try would meet again', () => {
+   for (const error of [Object.assign(new Error('x'), { status: 429 }), Object.assign(new Error('x'), { status: 503 }),
+-    Object.assign(new Error('connect'), { code: 'ECONNRESET' }), new TypeError('fetch failed'), new Error('getaddrinfo EAI_AGAIN api.example.com')]) {
++    Object.assign(new Error('connect'), { code: 'ECONNRESET' }), new TypeError('fetch failed'), new Error('getaddrinfo EAI_AGAIN api.example.com'),
++    Object.assign(new Error('upstream 403: 上游账号触发风控限制，稍后将自动恢复'), { status: 403 }),
++    new Error('relay API error (403): {"message":"upstream 403: 上游账号触发风控限制，稍后将自动恢复"}')]) {
+     expect(transient(error)).toBe(true)
+   }
+-  for (const error of [Object.assign(new Error('x'), { status: 400 }), Object.assign(new Error('x'), { status: 401 }), new Error('context too long'), 'LlmError: offline']) {
++  for (const error of [Object.assign(new Error('x'), { status: 400 }), Object.assign(new Error('x'), { status: 401 }), new Error('context too long'), 'LlmError: offline',
++    Object.assign(new Error('Forbidden: this key may not use the model'), { status: 403 })]) {
+     expect(transient(error)).toBe(false)
+   }
+ })
+diff --git a/tests/runtime.spec.ts b/tests/runtime.spec.ts
+index fd737f2..7bb293d 100644
+--- a/tests/runtime.spec.ts
++++ b/tests/runtime.spec.ts
+@@ -93,13 +93,13 @@ const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
+   const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+   return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }), collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
+ }) }
+-/** Source account overrides for test setup; `feishu: null` disables the Feishu source. */
+-interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null }
++/** Source account overrides for test setup; `feishu: null` disables the Feishu source, and `githubOff` switches the GitHub Source off. */
++interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null; githubOff?: true }
+ function seed(store: Store, accounts: Accounts = {}): void {
+   const settings = store.settings()
+   const { feishu: _feishu, ...others } = settings.sources
+   const feishu = accounts.feishu === null ? undefined : { ...settings.sources.feishu?.config, cli: BOT(), ...accounts.feishu }
+-  store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
++  store.saveSettings(SettingsSchema.parse({ ...settings, sources: { ...others, github: { enabled: !accounts.githubOff, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
+ }
+ let restarts: ReturnType<typeof vi.fn<() => void>>
+ async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
+@@ -840,6 +840,16 @@ it('waits for setup without the agent\'s GitHub CLI: the panel works, and nothin
+   await vi.waitFor(() => expect(restarts).toHaveBeenCalledTimes(2))
+ })
+ 
++it('works from its other Sources with the GitHub Source off: setup resolves no account, and gh fails for workers', async () => {
++  answers = { ...answers, 'git config -z --show-origin --get-all user.useconfigonly': `file:${join(directory, 'worker-gitconfig')}\0true\0` }
++  const next = await restart({}, { githubOff: true, github: { repository: '', cli: '' } })
++  await next.ready
++  expect(next.setupProblem).toBeUndefined()
++  expect(next.configured()).toBe(true)
++  expect(next.deployment).toMatchObject({ repository: '', github: { cli: '', login: '', noreply: '' } })
++  expect(readFileSync(join(directory, 'worker-bin', 'gh'), 'utf8')).toContain('this installation has no GitHub account')
++  expect(readFileSync(join(directory, 'worker-gitconfig'), 'utf8')).not.toContain('credential "https://github.com"')
++})
+ it('reports each setup problem where the operator fixes it, and checks the agent CLI the way worker shells run it', async () => {
+   const needs = async (place: string, code: string, values: Record<string, string>, accounts: Accounts = {}) => {
+     const next = await restart({}, accounts)
+diff --git a/tests/spool.spec.ts b/tests/spool.spec.ts
+new file mode 100644
+index 0000000..58caff5
+--- /dev/null
++++ b/tests/spool.spec.ts
+@@ -0,0 +1,59 @@
++import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import type { OutboundMessage } from '../src/core/index.ts'
++import { readSpool, sendSpool, spoolKind, spoolTrigger, SpoolMessageSchema, type SpoolConfig } from '../src/sources/spool.ts'
++import { localHost } from './fixtures/local-sources.ts'
++const hosts: ReturnType<typeof localHost>[] = []
++afterEach(() => { for (const h of hosts.splice(0)) { h.store.close(); rmSync(h.dir, { recursive: true, force: true }) } })
++function host() {
++  const h = localHost([spoolKind], {})
++  const config: SpoolConfig = { inDir: join(h.dir, 'in'), outDir: join(h.dir, 'out'), pollSeconds: 5,
++    senders: [{ id: 'dsbot', kind: 'person', business: 'general' }, { id: 'monitor', kind: 'bot', business: 'ops' }] }
++  h.store.saveSettings({ ...h.store.settings(), sources: { spool: { enabled: true, config } },
++    policy: { ...h.store.settings().policy, sources: { spool: { allowed: [{ id: 'dsbot' }] } } } })
++  mkdirSync(config.inDir, { recursive: true })
++  hosts.push(h)
++  return { ...h, config }
++}
++const drop = (dir: string, name: string, body: unknown): void => { writeFileSync(join(dir, name), typeof body === 'string' ? body : JSON.stringify(body)) }
++describe('the spool Source', () => {
++  it('takes a relayed request as explicit, filters an unlisted sender, sets aside what is not a request, and moves every file it read', async () => {
++    const h = host()
++    drop(h.config.inDir, 'a.json', { id: 'm1', sender: 'dsbot', conversation: 'chief', text: '整理本周的周报', business: 'content' })
++    drop(h.config.inDir, 'b.json', { id: 'm2', sender: 'stranger', text: '帮我做点事' })
++    drop(h.config.inDir, 'c.json', '{not json')
++    expect(await readSpool(h.ctx, h.config, new Date())).toEqual({ received: 1, unreadable: 1 })
++    const relayed = spoolTrigger(SpoolMessageSchema.parse({ id: 'm1', sender: 'dsbot', conversation: 'chief', text: '整理本周的周报', business: 'content' }),
++      { kind: 'person', business: 'general' }, h.config.outDir, new Date())
++    expect(h.engine.candidate(relayed.id)?.strength).toBe('explicit')
++    expect(relayed).toMatchObject({ human: true, addressed: 'direct', threads: [{ source: 'spool', id: 'chief/m1' }],
++      channel: { address: { conversation: 'chief', dir: join(h.config.outDir, 'chief') } }, meta: { business: 'content', sender: 'dsbot' } })
++    expect(readdirSync(join(h.config.inDir, '.done')).sort()).toEqual(['a.json', 'b.json'])
++    expect(readdirSync(join(h.config.inDir, '.bad'))).toEqual(['c.json'])
++    expect(spoolKind.scope!({ meta: { sender: 'stranger' } }, h.config)).toEqual({ listened: false, reason: 'sender_not_listed' })
++  })
++  it('admits a program acting for itself only as a listed bot', async () => {
++    const h = host()
++    drop(h.config.inDir, 'alert.json', { id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' })
++    await readSpool(h.ctx, h.config, new Date())
++    const trigger = spoolTrigger(SpoolMessageSchema.parse({ id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' }),
++      { kind: 'bot', business: 'ops' }, h.config.outDir, new Date())
++    expect(trigger).toMatchObject({ human: false, addressed: 'mention', meta: { business: 'ops' } })
++    expect(h.engine.candidate(trigger.id)).toBeUndefined()
++    expect(h.assessor.request).not.toHaveBeenCalled()
++  })
++  it('writes each reply once into its conversation\'s folder, and has nowhere to answer without one', async () => {
++    const h = host()
++    const dir = join(h.config.outDir, 'chief')
++    const message = (address: Record<string, string>): OutboundMessage => ({ id: 'r1', kind: 'reply', text: '周报在 outputs/weekly.md', ticketId: 't1',
++      channel: { source: 'spool', thread: 'spool:chief/m1', address } })
++    const address = { conversation: 'chief', root: 'm1', message: 'm1', sender: 'dsbot', dir }
++    expect(await sendSpool(undefined, message(address))).toBe('sent')
++    expect(await sendSpool(undefined, message(address))).toBe('sent')
++    expect(JSON.parse(readFileSync(join(dir, 'r1.json'), 'utf8'))).toMatchObject({ id: 'r1', kind: 'reply', thread: 'm1', replyTo: 'm1', ticket: 't1' })
++    expect(await sendSpool(undefined, message({ conversation: 'chief', sender: 'dsbot' }))).toBe('gone')
++    expect(spoolKind.channel!.allowed!(address, h.config)).toBe(true)
++    expect(spoolKind.channel!.allowed!({ ...address, dir: '/tmp/x' }, h.config)).toBe(false)
++  })
++})
+diff --git a/tests/timer.spec.ts b/tests/timer.spec.ts
+new file mode 100644
+index 0000000..52aecde
+--- /dev/null
++++ b/tests/timer.spec.ts
+@@ -0,0 +1,116 @@
++import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import type { OutboundMessage, Trigger } from '../src/core/index.ts'
++import { KV } from '../src/kv.ts'
++import { latestBetween, nextAfter, parseCron, validCron } from '../src/sources/cron.ts'
++import { scheduleTrigger, sendTimer, timerKind, timerRound, wakeReason, type TimerConfig } from '../src/sources/timer.ts'
++import { localHost, openTicket } from './fixtures/local-sources.ts'
++const hosts: ReturnType<typeof localHost>[] = []
++afterEach(() => { for (const h of hosts.splice(0)) { h.store.close(); rmSync(h.dir, { recursive: true, force: true }) } })
++const local = (text: string): Date => new Date(text)
++describe('cron', () => {
++  it('finds the next occurrence of each field form on the local clock', () => {
++    expect(nextAfter(parseCron('0 8 * * *'), local('2026-11-01T07:59:30'))).toEqual(local('2026-11-01T08:00:00'))
++    expect(nextAfter(parseCron('0 8 * * *'), local('2026-11-01T08:00:00'))).toEqual(local('2026-11-02T08:00:00'))
++    expect(nextAfter(parseCron('*/15 9-10 * * *'), local('2026-11-01T10:46:00'))).toEqual(local('2026-11-02T09:00:00'))
++    expect(nextAfter(parseCron('30 18 * * 1,3,5'), local('2026-11-01T12:00:00'))).toEqual(local('2026-11-02T18:30:00'))
++    expect(nextAfter(parseCron('0 0 * * 7'), local('2026-11-02T00:00:00'))).toEqual(local('2026-11-08T00:00:00'))
++    // With both day fields restricted, either one matches, as in cron.
++    expect(nextAfter(parseCron('0 0 15 * 1'), local('2026-11-03T00:00:00'))).toEqual(local('2026-11-09T00:00:00'))
++    expect(nextAfter(parseCron('@daily'), local('2026-11-01T23:59:00'))).toEqual(local('2026-11-02T00:00:00'))
++    expect(nextAfter(parseCron('0 0 31 2 *'), local('2026-01-01T00:00:00'))).toBeUndefined()
++  })
++  it('refuses what is not five fields within range', () => {
++    for (const bad of ['0 8 * *', '60 8 * * *', '0 24 * * *', '0 8 * * 8', 'every day', '5-1 * * * *']) expect(validCron(bad)).toBe(false)
++    expect(validCron('5/20 * * * *')).toBe(true)
++  })
++  it('runs a missed stretch once, at its latest occurrence', () => {
++    expect(latestBetween(parseCron('0 * * * *'), local('2026-11-01T05:30:00'), local('2026-11-01T09:10:00'))).toEqual(local('2026-11-01T09:00:00'))
++    expect(latestBetween(parseCron('0 * * * *'), local('2026-11-01T09:00:00'), local('2026-11-01T09:59:00'))).toBeUndefined()
++  })
++})
++function host(overrides: Partial<TimerConfig> = {}) {
++  const h = localHost([timerKind], {})
++  const config: TimerConfig = { schedules: [{ id: 'daily-brief', cron: '0 8 * * *', business: 'research', type: 'research', text: '写今天的简报', state: 'on' }],
++    wakeDir: join(h.dir, 'wake'), reportsDir: join(h.dir, 'reports'), pollSeconds: 15, ...overrides }
++  h.store.saveSettings({ ...h.store.settings(), sources: { timer: { enabled: true, config } },
++    policy: { ...h.store.settings().policy, sources: { timer: { allowed: [{ id: 'operator' }] } } } })
++  hosts.push(h)
++  return { ...h, config }
++}
++describe('schedules', () => {
++  it('start counting when first seen, then make each occurrence an explicit request on a Thread of its own, once', async () => {
++    const h = host()
++    expect(await timerRound(h.ctx, h.config, local('2026-11-01T07:00:00'))).toMatchObject({ started: 0 })
++    expect(h.ctx.state.get(KV.timer.last('daily-brief'))).toBe(local('2026-11-01T07:00:00').toISOString())
++    expect(await timerRound(h.ctx, h.config, local('2026-11-01T08:00:20'))).toMatchObject({ started: 1 })
++    expect(await timerRound(h.ctx, h.config, local('2026-11-01T08:01:00'))).toMatchObject({ started: 0 })
++    const trigger = scheduleTrigger(h.config.schedules[0]!, local('2026-11-01T08:00:00'), h.config)
++    expect(h.engine.candidate(trigger.id)?.strength).toBe('explicit')
++    expect(trigger).toMatchObject({ human: true, addressed: 'direct', actor: { source: 'timer', id: 'operator' },
++      meta: { kind: 'schedule', schedule: 'daily-brief', business: 'research', type: 'research', report: join(h.dir, 'reports', 'research', 'daily-brief.md') } })
++    expect(trigger.threads[0]!.id).toMatch(/^run\/daily-brief\/20261101-0800$/)
++    expect(scheduleTrigger(h.config.schedules[0]!, local('2026-11-02T08:00:00'), h.config).threads[0]).not.toEqual(trigger.threads[0])
++  })
++  it('skip a schedule that is off', async () => {
++    const h = host()
++    const off = { ...h.config, schedules: [{ ...h.config.schedules[0]!, state: 'off' as const }] }
++    await timerRound(h.ctx, off, local('2026-11-01T07:00:00'))
++    expect(h.ctx.state.get(KV.timer.last('daily-brief'))).toBeUndefined()
++  })
++  it('write their tickets\' replies into the schedule\'s log, and leave the acknowledgement out', async () => {
++    const h = host()
++    const file = join(h.dir, 'reports', 'research', 'daily-brief.md')
++    const message = (id: string, kind: OutboundMessage['kind']): OutboundMessage => ({ id, kind, text: `${kind} text`,
++      channel: { source: 'timer', thread: 'timer:run/daily-brief/20261101-0800', address: { file, schedule: 'daily-brief', business: 'research' } } })
++    expect(await sendTimer(undefined, message('a1', 'acknowledgement'))).toBe('sent')
++    expect(existsSync(file)).toBe(false)
++    expect(await sendTimer(undefined, message('r1', 'reply'))).toBe('sent')
++    expect(await sendTimer(undefined, message('r1', 'reply'))).toBe('sent')
++    const text = readFileSync(file, 'utf8')
++    expect(text).toMatch(/^# 定时任务 daily-brief\n/)
++    expect(text.match(/reply text/g)).toHaveLength(1)
++    expect(timerKind.channel!.allowed!({ file }, h.config)).toBe(true)
++    expect(timerKind.channel!.allowed!({ file: '/tmp/elsewhere.md' }, h.config)).toBe(false)
++  })
++})
++describe('wake requests', () => {
++  const origin: Trigger = { id: 'origin', source: 'inbox', threads: [{ source: 'inbox', id: 'research/a' }], actor: { source: 'inbox', id: 'alice' },
++    human: true, addressed: 'direct', at: '2026-11-01T00:00:00.000Z', text: '调研', meta: { business: 'research' } }
++  const request = (name: string, body: Record<string, unknown>, dir: string) => {
++    mkdirSync(dir, { recursive: true })
++    writeFileSync(join(dir, name), JSON.stringify({ created: '2026-11-01T00:00:00.000Z', ...body }))
++  }
++  it('continue an open ticket through the Thread it started on once due, and wait until then', async () => {
++    const h = host({ schedules: [] })
++    openTicket(h.store, 't1', origin)
++    request('t1.1.json', { ticket: 't1', at: '2026-11-02T09:00:00.000Z', note: '继续第二天的检索' }, h.config.wakeDir)
++    expect(await timerRound(h.ctx, h.config, new Date('2026-11-02T08:59:00.000Z'))).toMatchObject({ waiting: 1, woken: 0 })
++    expect(await timerRound(h.ctx, h.config, new Date('2026-11-02T09:00:05.000Z'))).toMatchObject({ waiting: 0, woken: 1 })
++    const ticket = h.store.tickets.get('t1')!
++    const input = ticket.inputs.find(item => item.kind === 'trigger')
++    expect(input).toBeDefined()
++    const trigger = h.store.triggers.get((input as { triggerId: string }).triggerId)!
++    expect(trigger).toMatchObject({ human: false, threads: [{ source: 'timer', id: 'wake/t1' }, { source: 'inbox', id: 'research/a' }] })
++    expect(trigger.text).toContain('继续第二天的检索')
++    expect(readdirSync(join(h.config.wakeDir, '.done'))).toEqual(['t1.1.json'])
++    // The machine's Trigger reaches no Eval of its own: the gate admits it nowhere.
++    expect(h.assessor.request).not.toHaveBeenCalled()
++  })
++  it('drop a request of a ticket that ended or does not exist, and set aside one that is not a request', async () => {
++    const h = host({ schedules: [] })
++    request('gone.json', { ticket: 'missing', at: '2026-11-01T00:00:00.000Z' }, h.config.wakeDir)
++    writeFileSync(join(h.config.wakeDir, 'bad.json'), '{"ticket": 1}')
++    await timerRound(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))
++    expect(readdirSync(join(h.config.wakeDir, '.done'))).toEqual(['gone.json'])
++    expect(readdirSync(join(h.config.wakeDir, '.bad'))).toEqual(['bad.json'])
++  })
++  it('are due when their file appears, or at their deadline', () => {
++    const base = { ticket: 't1', note: '', created: '2026-11-01T00:00:00.000Z' }
++    const now = new Date('2026-11-01T12:00:00.000Z')
++    expect(wakeReason({ ...base, whenExists: '/done.flag' }, now, () => true)).toBe('file')
++    expect(wakeReason({ ...base, whenExists: '/done.flag', deadline: '2026-11-01T11:00:00.000Z' }, now, () => false)).toBe('deadline')
++    expect(wakeReason({ ...base, whenExists: '/done.flag', deadline: '2026-11-01T13:00:00.000Z' }, now, () => false)).toBeUndefined()
++  })
++})
+diff --git a/tests/tools.spec.ts b/tests/tools.spec.ts
+index f3dde91..65ff34e 100644
+--- a/tests/tools.spec.ts
++++ b/tests/tools.spec.ts
+@@ -265,12 +265,17 @@ it('checks an acknowledgement against the IM word limit, not a character count',
+ 
+ it('saves a settings block by name, a Source\'s block with the Source\'s id', async () => {
+   const save = (args: Record<string, unknown>) => h.runTool(h.runtime.masterId, 'orchestrator_settings_save', args)
++  const feishu = { config: h.runtime.store.settings().sources.feishu?.config ?? {}, revision: h.runtime.store.blockRevision('source:feishu') }
++  const off = { enabled: false, config: feishu.config }
++  await expect(save({ block: 'source', value: off, revision: feishu.revision })).rejects.toThrow('source names the Source')
++  await expect(save({ block: 'source:feishu', value: off, revision: feishu.revision })).rejects.toThrow()
++  expect(await save({ block: 'source', source: 'feishu', value: off, revision: feishu.revision })).toMatchObject({ saved: true })
++  expect(h.runtime.store.settings().sources.feishu?.enabled).toBe(false)
++  // Switching the GitHub Source changes whether setup resolves GitHub at all, which, as an account change, only the panel may do.
+   const github = { config: h.runtime.store.settings().sources.github!.config, revision: h.runtime.store.blockRevision('source:github') }
+-  const off = { enabled: false, config: github.config }
+-  await expect(save({ block: 'source', value: off, revision: github.revision })).rejects.toThrow('source names the Source')
+-  await expect(save({ block: 'source:github', value: off, revision: github.revision })).rejects.toThrow()
+-  expect(await save({ block: 'source', source: 'github', value: off, revision: github.revision })).toMatchObject({ saved: true })
+-  expect(h.runtime.store.settings().sources.github?.enabled).toBe(false)
++  await expect(save({ block: 'source', source: 'github', value: { enabled: false, config: github.config }, revision: github.revision }))
++    .rejects.toThrow('management panel')
++  expect(h.runtime.store.settings().sources.github?.enabled).not.toBe(false)
+   expect(await save({ block: 'pause', value: { paused: true }, revision: 0 })).toEqual({ paused: true })
+ })
+ 
+diff --git a/tsdown.config.ts b/tsdown.config.ts
+index 0aabd00..e31c6cc 100644
+--- a/tsdown.config.ts
++++ b/tsdown.config.ts
+@@ -7,7 +7,8 @@ const raw = { name: 'raw',
+   load: (id: string) => id.endsWith('?raw') ? { code: `export default ${JSON.stringify(readFileSync(id.slice(0, -4), 'utf8'))}`, moduleType: 'js' as const }
+     : undefined }
+ export default defineConfig([
+-  { entry: { index: 'src/index.ts', 'github-watch': 'src/sources/github.ts', 'feishu-watch': 'src/sources/feishu.ts' }, outDir: 'lib', format: 'esm', fixedExtension: false, platform: 'node', target: 'es2024', dts: true, clean: true, deps: { neverBundle: [/^@deepseek-ai\//, 'zod', 'proper-lockfile'] } },
++  { entry: { index: 'src/index.ts', 'github-watch': 'src/sources/github.ts', 'feishu-watch': 'src/sources/feishu.ts',
++    'inbox-watch': 'src/sources/inbox.ts', 'timer-watch': 'src/sources/timer.ts', 'spool-watch': 'src/sources/spool.ts' }, outDir: 'lib', format: 'esm', fixedExtension: false, platform: 'node', target: 'es2024', dts: true, clean: true, deps: { neverBundle: [/^@deepseek-ai\//, 'zod', 'proper-lockfile'] } },
+   { entry: { client: 'src/client/index.tsx' }, outDir: 'lib', format: 'cjs', platform: 'browser', dts: false, clean: false, plugins: [raw],
+     deps: { neverBundle: ['react', 'react/jsx-runtime', 'react-dom'] },
+     outputOptions: { entryFileNames: 'client.js', banner: 'window.__ModuleLoader__.load({ id: "dsh-superagent", factory: (require) => {', footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' } },
+-- 
+2.54.0 (Apple Git-157)
+

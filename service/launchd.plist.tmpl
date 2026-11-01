@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{{LABEL}}</string>
+  <key>ProgramArguments</key><array><string>{{NODE}}</string><string>{{HQ_HOME}}/bin/hq</string><string>{{COMMAND}}</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{{PATH}}</string><key>HOME</key><string>{{USER_HOME}}</string><key>HQ_HOME</key><string>{{HQ_HOME}}</string></dict>
+  <key>RunAtLoad</key><true/>
+  {{SCHEDULE}}
+  <key>StandardOutPath</key><string>{{LOGS}}/{{COMMAND}}.log</string>
+  <key>StandardErrorPath</key><string>{{LOGS}}/{{COMMAND}}.log</string>
+</dict></plist>

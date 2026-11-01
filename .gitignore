@@ -1,0 +1,13 @@
+# Your own setup: written by scripts/setup.mjs. Keep them in a private fork if you want them versioned.
+hq.config.json
+businesses/
+vendor/
+# Runtime data: notes, tickets, queues, state and logs.
+inbox/
+work/
+spool/
+timers/
+state/
+logs/
+node_modules/
+.DS_Store

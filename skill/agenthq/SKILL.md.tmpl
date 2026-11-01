@@ -1,0 +1,54 @@
+---
+name: agenthq
+description: 把任务交给 AgentHQ（本机 7×24 运行的 superagent 工单系统）去做，并查看它的进度和需要我处理的事。当用户说「交给 HQ / 让 AgentHQ 去做 / 长期跟进 / 明天继续 / 每天定时做」，或问「HQ 现在有什么要我处理」「那个任务做完没有」时使用；工单里的执行者也用它登记唤醒和后台作业。
+whenToUse: 需要把一件能独立完成、可能耗时很久或跨天的工作交出去；或者要看 AgentHQ 的状态、待处理事项、某篇请求笔记的结果。
+---
+
+# AgentHQ
+
+AgentHQ 在本机常驻：每件事一张工单、一个独立执行会话和目录，做完把结果写回请求笔记。面板：<http://127.0.0.1:{{HUB_PORT}}/>。
+
+命令行 `hq`（安装后在 `~/.local/bin/hq`，任何目录可用）。
+
+## 交任务（给人和 DS Bot 用）
+
+```sh
+hq ask <业务> "<自包含的请求：要什么、交付什么、什么时候要>" [--title 标题] [--type research|code|content|ops|general] [--repo /仓库绝对路径]
+```
+
+- 业务：运行 `hq business list` 看本机有哪些业务和它们的 id；写代码的业务要给 `--repo`。
+- 命令打印请求笔记的路径；大约 15 秒内会出现工单，确认和结果都追加在这篇笔记末尾。
+- 请求要自包含：执行者看不到你的对话上下文。
+- 补充或回答执行者的问题：`hq reply <笔记路径> "<内容>"`。验收完：`hq done <笔记路径>`。
+
+## 看进度
+
+```sh
+hq attention          # 只看需要用户处理的事（等回答、等验收、受阻、失败）
+hq status             # 实例、负载、模型中转、看门狗
+hq notes --days 3     # 最近的请求笔记和状态（待智能体 / 已回复 / 已完成）
+```
+
+把结果转告用户时，给出笔记路径或面板地址，不要编造进度。
+
+## 不能用 hq 命令时
+
+写一个 JSON 文件到投递目录（发送者要在 hq.config.json 的 senders 里，例如 `cli`），回复会写到 `{{HQ_HOME}}/spool/out/<conversation>/`：
+
+```sh
+cat > {{HQ_HOME}}/spool/in/$(date +%s).json <<'JSON'
+{"id":"<唯一 id>","sender":"cli","conversation":"<对话名>","text":"<自包含的请求>","business":"general"}
+JSON
+```
+
+或者 `curl -s -X POST http://127.0.0.1:{{HUB_PORT}}/api/ask -H 'x-hq-request: 1' -H 'content-type: application/json' -d '{"business":"general","title":"…","text":"…"}'`。
+
+## 工单里的执行者
+
+- 稍后或隔天继续：`hq wake --in 2h --note "下一步"` 或 `hq wake --at "2026-11-02 09:00" --note ...`，然后更新 STATE.md 并结束这一轮。
+- 超过 30 分钟的命令：`hq job start --name <名字> -- <命令>`，结束时自动唤醒；`hq job status` 看状态。
+
+## 注意
+
+- 不要替用户把公开发布、对外发送、付款、部署这类事写成"直接执行"的请求；写成"准备好、等我确认"。
+- `hq ask` 会真的开一张工单并消耗模型调用，不要重复提交同一件事。

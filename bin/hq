@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+// hq: the AgentHQ command line. Run `hq help` for the commands.
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { applySettings, ensureFolders, pushPrompts } from '../lib/apply.mjs'
+import { api, appendPassage, createNote, duration, HOME, instanceOf, listNotes, loadConfig, localStamp, markDone, paths, saveConfig, when } from '../lib/core.mjs'
+import { summary } from '../lib/summary.mjs'
+
+const HELP = `hq — AgentHQ command line
+
+Requests (for people, DS Bot and scripts):
+  hq ask <business> <text…> [--title T] [--type research|code|content|ops|routine|general] [--repo /abs/path]
+                                 write a request note into the business's inbox folder
+  hq reply <note> <text…>        add a passage to a note (a follow-up for its ticket)
+  hq done <note>                 mark a note done
+  hq notes [business] [--days N] [--json]   recent notes and where they stand
+  hq status [--json]             instances, what needs a person, load, models, DS Bot, watchdog
+  hq attention [--json]          only what needs a person
+
+Inside a ticket (workers; use DSH_SUPERAGENT_TICKET):
+  hq wake (--in 2h | --at "2026-11-02 09:00") [--when-exists /abs/file] [--deadline 6h] --note "next step"
+  hq job start --name N [--deadline 6h] -- <command…>   run detached; wakes the ticket when it ends
+  hq job status
+
+Operator:
+  hq apply [--instance hq]       push hq.config.json and prompts/ to the instance
+  hq prompts [--instance hq]     push prompts/ only
+  hq business add <id> --title T [--type T] [--repo /abs] | hq business list
+  hq schedule add <id> --cron "30 8 * * *" --text T [--business B] [--type T] | hq schedule list | hq schedule rm <id>
+  hq watchdog                    one supervision round (launchd runs it every 5 minutes)
+  hq hub                         serve the dashboard on 127.0.0.1:<hub.port>
+`
+const argv = process.argv.slice(2)
+function options(args) {
+  const named = {}, rest = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === '--') { rest.push(...args.slice(i + 1)); named['--'] = true; break }
+    if (arg.startsWith('--')) {
+      const [key, inline] = arg.slice(2).split(/=(.*)/s)
+      if (inline !== undefined) named[key] = inline
+      else if (i + 1 < args.length && !args[i + 1].startsWith('--')) named[key] = args[++i]
+      else named[key] = true
+    } else rest.push(arg)
+  }
+  return { named, rest }
+}
+const out = (value, json) => console.log(json ? JSON.stringify(value, null, 2) : value)
+const fail = message => { console.error(`hq: ${message}`); process.exit(2) }
+const resolveNote = (config, ref) => {
+  if (ref.startsWith('/')) return ref
+  const match = listNotes(config).find(note => note.file.endsWith(ref) || note.path === ref || note.title === ref)
+  if (!match) fail(`no note ${ref}`)
+  return match.file
+}
+/** The ticket a command runs for: --ticket, the execution variables, or the `.hq/ticket.json` hq-prepare wrote above the current folder. */
+function ticketEnv(named) {
+  let dir = process.env.DSH_SUPERAGENT_DIR || ''
+  let ticket = named.ticket || process.env.DSH_SUPERAGENT_TICKET || ''
+  for (let at = process.cwd(); !ticket || !dir; at = join(at, '..')) {
+    const meta = join(at, '.hq', 'ticket.json')
+    if (existsSync(meta)) { ticket ||= JSON.parse(readFileSync(meta, 'utf8')).ticket; dir ||= at; break }
+    if (at === '/' || at === join(at, '..')) break
+  }
+  if (!ticket) fail('no ticket: run inside a ticket directory, or pass --ticket <id>')
+  return { ticket, dir: dir || process.cwd() }
+}
+function fileWake(request) {
+  mkdirSync(paths.wake, { recursive: true })
+  const file = join(paths.wake, `${request.ticket}.${Date.now()}.json`)
+  writeFileSync(file, `${JSON.stringify(request, null, 2)}\n`)
+  return file
+}
+
+const [command, ...args] = argv
+const { named, rest } = options(args)
+const config = loadConfig()
+try {
+  switch (command) {
+    case undefined: case 'help': case '--help': case '-h': console.log(HELP); break
+    case 'ask': {
+      const [business, ...words] = rest
+      if (!business || !words.length) fail('usage: hq ask <business> <text…>')
+      const file = createNote(config, business, { title: named.title, text: words.join(' '), type: named.type, repo: named.repo })
+      out(named.json ? { file } : `已写入 ${file}\n收件箱会在约 15 秒内读到它；回复会追加在同一篇笔记里。`, named.json)
+      break
+    }
+    case 'reply': {
+      const [ref, ...words] = rest
+      if (!ref || !words.length) fail('usage: hq reply <note> <text…>')
+      const file = resolveNote(config, ref)
+      appendPassage(file, words.join(' '))
+      out(`已追加到 ${file}`)
+      break
+    }
+    case 'done': { const file = resolveNote(config, rest[0] ?? fail('usage: hq done <note>')); markDone(file); out(`已标记完成 ${file}`); break }
+    case 'notes': {
+      const notes = listNotes(config, { business: rest[0], days: named.days ? Number(named.days) : undefined })
+      if (named.json) { out(notes, true); break }
+      const label = { waiting: '待智能体', answered: '已回复', done: '已完成', draft: '草稿', empty: '空' }
+      out(notes.map(note => `${localStamp(new Date(note.changed))}  ${label[note.status] ?? note.status}  [${note.business}] ${note.title}\n    ${note.file}`).join('\n') || '没有笔记')
+      break
+    }
+    case 'status': case 'attention': {
+      const view = await summary(config)
+      if (named.json) { out(command === 'attention' ? view.attention : view, true); break }
+      const lines = []
+      if (command === 'status') {
+        for (const instance of view.instances) {
+          lines.push(`■ ${instance.title}（${instance.id}）${instance.up ? '' : '  不在线'}  ${instance.panel}`)
+          if (instance.up) {
+            lines.push(`  setup: ${instance.setup ?? 'ok'}  paused: ${instance.paused}  load: ${instance.load.running} 运行 / ${instance.load.queued} 排队 / 上限 ${instance.load.maxWorkers}`)
+            for (const problem of instance.problems) lines.push(`  ! ${problem}`)
+          }
+        }
+        if (view.models.relay) lines.push(`■ 模型中转：最近 1 小时 ${Object.entries(view.models.lastHour).map(([status, count]) => `${status}×${count}`).join(' ') || '无调用'}`)
+        if (view.dsbot.installed !== false) lines.push(`■ DS Bot：${view.dsbot.online ? `在线，待回答 ${view.dsbot.questions}，待审批 ${view.dsbot.approvals}` : '不在线（DeepSeek Harness 桌面端未开）'}`)
+        lines.push(`■ 看门狗：${view.watchdog.at ? `${localStamp(new Date(view.watchdog.at))} ${view.watchdog.summary}` : '未运行'}`)
+      }
+      lines.push(`■ 需要你：${view.attention.length ? '' : '没有'}`)
+      for (const item of view.attention) lines.push(`  - [${item.instance}] ${item.label}：${item.title}${item.link ? `\n      ${item.link}` : ''}`)
+      out(lines.join('\n'))
+      break
+    }
+    case 'wake': {
+      const { ticket } = ticketEnv(named)
+      const now = new Date()
+      const at = named.in ? new Date(now.getTime() + duration(named.in)) : named.at ? when(named.at, now) : undefined
+      if (!at && !named['when-exists']) fail('usage: hq wake (--in 2h | --at "2026-11-02 09:00" | --when-exists /abs/file) --note "next step"')
+      const deadline = named.deadline ? (/^\d/.test(named.deadline) && /[smhd]$/i.test(named.deadline) ? new Date(now.getTime() + duration(named.deadline)) : when(named.deadline, now)) : undefined
+      const request = { ticket, ...at ? { at: at.toISOString() } : {}, ...named['when-exists'] ? { whenExists: named['when-exists'] } : {},
+        ...deadline ? { deadline: deadline.toISOString() } : {}, note: typeof named.note === 'string' ? named.note : '', created: now.toISOString() }
+      const file = fileWake(request)
+      out(`已登记唤醒：${at ? localStamp(at) : `文件 ${named['when-exists']} 出现时`}${deadline ? `（最晚 ${localStamp(deadline)}）` : ''}\n${file}\n现在更新 STATE.md 并结束这一轮；到时这张工单会收到"定时唤醒"消息。`)
+      break
+    }
+    case 'job': {
+      const [sub] = rest
+      const { ticket, dir } = ticketEnv(named)
+      const jobs = join(dir, '.hq', 'jobs')
+      mkdirSync(jobs, { recursive: true })
+      if (sub === 'status') {
+        const names = existsSync(jobs) ? readdirSync(jobs).filter(name => name.endsWith('.cmd')).map(name => name.slice(0, -4)) : []
+        out(names.map(name => {
+          const exit = existsSync(join(jobs, `${name}.exit`)) ? readFileSync(join(jobs, `${name}.exit`), 'utf8').trim() : null
+          return `${name}: ${exit === null ? '运行中' : `已结束，退出码 ${exit}`}  日志 ${join(jobs, `${name}.log`)}`
+        }).join('\n') || '没有后台作业')
+        break
+      }
+      if (sub !== 'start' || !named['--'] || !named.name) fail('usage: hq job start --name N [--deadline 6h] -- <command…>')
+      const command = args.slice(args.indexOf('--') + 1).join(' ')
+      const name = String(named.name).replace(/[^A-Za-z0-9_-]/g, '-')
+      const exitFile = join(jobs, `${name}.exit`), log = join(jobs, `${name}.log`)
+      writeFileSync(join(jobs, `${name}.cmd`), `${command}\n`)
+      const script = `${command}\nstatus=$?\necho $status > ${JSON.stringify(`${exitFile}.tmp`)} && mv ${JSON.stringify(`${exitFile}.tmp`)} ${JSON.stringify(exitFile)}`
+      const fd = openSync(log, 'a')
+      // A new session (setsid), so the worker's shell job ending does not end the job.
+      spawn('/bin/sh', ['-c', script], { cwd: dir, detached: true, stdio: ['ignore', fd, fd] }).unref()
+      const now = new Date()
+      const deadline = new Date(now.getTime() + duration(named.deadline ?? '12h'))
+      fileWake({ ticket, whenExists: exitFile, deadline: deadline.toISOString(), note: `后台作业 ${name} 已结束（或到了截止时间）：读 ${log} 和 ${exitFile}，然后按 STATE.md 继续。`, created: now.toISOString() })
+      out(`后台作业 ${name} 已启动，日志 ${log}\n它结束时（最晚 ${localStamp(deadline)}）这张工单会被唤醒；现在可以更新 STATE.md 并结束这一轮。`)
+      break
+    }
+    case 'apply': {
+      const instance = instanceOf(config, named.instance)
+      await applySettings(instance, config)
+      await pushPrompts(instance)
+      break
+    }
+    case 'prompts': await pushPrompts(instanceOf(config, named.instance)); break
+    case 'business': {
+      const [sub, id] = rest
+      if (sub === 'list' || !sub) { out(config.businesses.map(item => `${item.id}\t${item.title}\t${item.type}\t${item.repo || ''}`).join('\n')); break }
+      if (sub !== 'add' || !id) fail('usage: hq business add <id> --title T [--type T] [--repo /abs]')
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) fail('a business id is lowercase letters, digits and dashes')
+      const entry = { id, title: named.title ?? id, type: named.type ?? 'general', repo: named.repo ?? '' }
+      config.businesses = [...config.businesses.filter(item => item.id !== id), entry]
+      saveConfig(config); ensureFolders(config)
+      await applySettings(instanceOf(config, named.instance), config)
+      out(`业务 ${id} 已添加：收件箱文件夹 ${join(paths.inbox, id)}，说明 ${join(HOME, 'businesses', id, 'AGENTS.md')}`)
+      break
+    }
+    case 'schedule': {
+      const [sub, id] = rest
+      if (sub === 'list' || !sub) { out(config.schedules.map(item => `${item.id}\t${item.state}\t${item.cron}\t[${item.business}] ${item.text.slice(0, 60)}`).join('\n') || '没有定时任务'); break }
+      if (sub === 'rm') { config.schedules = config.schedules.filter(item => item.id !== id) }
+      else if (sub === 'add' && id && named.cron && named.text) {
+        config.schedules = [...config.schedules.filter(item => item.id !== id), { id, cron: named.cron, business: named.business ?? 'general', type: named.type ?? 'routine', text: named.text, state: named.off ? 'off' : 'on' }]
+      } else fail('usage: hq schedule add <id> --cron "30 8 * * *" --text T [--business B] [--type T] [--off] | hq schedule rm <id>')
+      saveConfig(config)
+      await applySettings(instanceOf(config, named.instance), config)
+      out(`定时任务已${sub === 'rm' ? '删除' : '保存'}：${id}`)
+      break
+    }
+    case 'watchdog': { const { watchdog } = await import('../lib/watchdog.mjs'); await watchdog(config); break }
+    case 'hub': { const { serveHub } = await import('../lib/hub.mjs'); await serveHub(config); break }
+    case 'api': { out(await api(instanceOf(config, named.instance), rest[0] ?? 'GET', rest[1] ?? 'state'), true); break }
+    default: fail(`unknown command ${command}; run hq help`)
+  }
+} catch (error) {
+  console.error(`hq: ${error.message ?? error}`)
+  process.exit(1)
+}

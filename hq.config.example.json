@@ -1,0 +1,74 @@
+{
+  "owner": {
+    "id": "me",
+    "name": "Me"
+  },
+  "instances": [
+    {
+      "id": "hq",
+      "title": "AgentHQ 主实例",
+      "profile": "superagent",
+      "url": "http://127.0.0.1:3082",
+      "checkout": "/absolute/path/to/dsh-superagent",
+      "stateDir": "/absolute/path/to/.dsh/state/superagent"
+    }
+  ],
+  "businesses": [
+    {
+      "id": "general",
+      "title": "综合",
+      "type": "general",
+      "repo": ""
+    }
+  ],
+  "schedules": [],
+  "senders": [
+    {
+      "id": "cli",
+      "kind": "person",
+      "business": "general"
+    }
+  ],
+  "rules": [],
+  "eval": {
+    "mode": "observe",
+    "timeoutSeconds": 180,
+    "model": {
+      "provider": "deepseek-official",
+      "model": "deepseek-flash",
+      "reasoningEffort": "high"
+    }
+  },
+  "executor": {
+    "maxWorkers": 3,
+    "model": {
+      "provider": "deepseek-official",
+      "model": "deepseek-flash",
+      "reasoningEffort": "max"
+    },
+    "blockedCommands": [
+      "security",
+      "osascript",
+      "sudo",
+      "vercel",
+      "wrangler",
+      "flyctl",
+      "aws",
+      "gcloud",
+      "az",
+      "stripe"
+    ]
+  },
+  "watchdog": {
+    "progressHours": 3,
+    "maxRestartsPerHour": 3,
+    "maxAutoRetries": 2,
+    "backupDays": 14
+  },
+  "hub": {
+    "port": 3090
+  },
+  "monitor": {
+    "relayLog": ""
+  }
+}

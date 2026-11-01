@@ -1,0 +1,7 @@
+AgentHQ builds on these projects; none of them is copied into this repository.
+
+- dsh-superagent-prototype — Copyright (c) 2026 DeepSeek Harness Team, MIT License.
+  https://github.com/deepseek-ai/dsh-superagent-prototype
+  patches/0001-agenthq-sources.patch modifies it and is distributed under the same MIT License.
+- DeepSeek Harness (@deepseek-ai/dsh) — MIT License, installed from npm.
+- ds-bot (optional web search) — Apache License 2.0, installed from npm only when you pass --web-search.

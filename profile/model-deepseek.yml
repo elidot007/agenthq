@@ -1,0 +1,6 @@
+# Model: the DeepSeek official API (DSH's built-in provider `deepseek-official`); its key is DEEPSEEK_API_KEY.
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+    reasoningEffort: high

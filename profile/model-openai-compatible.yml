@@ -1,0 +1,34 @@
+# Model: an OpenAI-compatible endpoint (a relay, a gateway or another vendor). Its key is read from the environment variable
+# or the ~/.dsh/.credentials.yaml ref named by apiKeyEnv.
+- id: llm-pi-ai
+  config:
+    providers:
+      {{PROVIDER}}:
+        displayName: {{PROVIDER}}
+        apiKeyEnv: {{KEY_ENV}}
+        api: openai-completions
+        baseURL: {{BASE_URL}}
+        reasoning: max
+        compat:
+          supportsStore: false
+          supportsDeveloperRole: false
+          supportsStrictMode: true
+          maxTokensField: max_tokens
+          requiresReasoningContentOnAssistantMessages: true
+          thinkingFormat: deepseek
+        models:
+          - id: {{MODEL_ID}}
+            name: {{MODEL_ID}}
+            input: [ text, image ]
+            contextWindow: 1000000
+            maxTokens: 384000
+            reasoningEfforts:
+              off:
+              low: low
+              high: high
+              max: max
+- id: agent-default-model
+  config:
+    provider: {{PROVIDER}}
+    model: {{MODEL_ID}}
+    reasoningEffort: high

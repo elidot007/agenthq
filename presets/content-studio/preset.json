@@ -1,0 +1,41 @@
+{
+  "description": "内容工作室：选题调研、多平台稿件",
+  "businesses": [
+    {
+      "id": "research",
+      "title": "调研",
+      "type": "research",
+      "repo": ""
+    },
+    {
+      "id": "content",
+      "title": "内容与增长",
+      "type": "content",
+      "repo": ""
+    },
+    {
+      "id": "general",
+      "title": "综合",
+      "type": "general",
+      "repo": ""
+    }
+  ],
+  "schedules": [
+    {
+      "id": "daily-digest",
+      "cron": "30 8 * * *",
+      "business": "general",
+      "type": "routine",
+      "state": "on",
+      "text": "写今天的选题早报：先运行 `hq notes --days 1` 汇总昨天交付的稿件和等我处理的事，再列出 5 个今天值得写的选题（每个附来源链接和适合的平台）。没有新内容时报告 dropped。"
+    }
+  ],
+  "senders": [
+    {
+      "id": "cli",
+      "kind": "person",
+      "business": "general"
+    }
+  ],
+  "rules": []
+}

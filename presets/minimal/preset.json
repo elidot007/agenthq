@@ -1,0 +1,20 @@
+{
+  "description": "只有一个\"综合\"业务，适合先试用",
+  "businesses": [
+    {
+      "id": "general",
+      "title": "综合",
+      "type": "general",
+      "repo": ""
+    }
+  ],
+  "schedules": [],
+  "senders": [
+    {
+      "id": "cli",
+      "kind": "person",
+      "business": "general"
+    }
+  ],
+  "rules": []
+}

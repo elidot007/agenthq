@@ -1,0 +1,8 @@
+[Unit]
+Description=AgentHQ watchdog round
+
+[Service]
+Type=oneshot
+Environment=HQ_HOME={{HQ_HOME}}
+Environment=PATH={{PATH}}
+ExecStart={{NODE}} {{HQ_HOME}}/bin/hq watchdog

@@ -1,0 +1,73 @@
+#!/bin/sh
+# AgentHQ prepare command (dsh-superagent Execution settings). It runs once per ticket, before its first Assignment, in the
+# execution root, with the ticket's execution variables. It builds the ticket directory from the business playbook and the
+# template of the kind of work: a fresh folder with its own git history, or, for code, a worktree of the named repository.
+set -eu
+# The AgentHQ home: HQ_HOME, else the checkout this script lives in (bin/..).
+HQ_HOME=${HQ_HOME:-$(cd "$(dirname "$0")/.." && pwd)}
+dir="$DSH_SUPERAGENT_DIR"
+name="$DSH_SUPERAGENT_NAME"
+ticket="$DSH_SUPERAGENT_TICKET"
+pick() { for value in "$@"; do if [ -n "$value" ]; then printf '%s' "$value"; return; fi; done; }
+business=$(pick "${DSH_SUPERAGENT_INBOX_BUSINESS:-}" "${DSH_SUPERAGENT_TIMER_BUSINESS:-}" "${DSH_SUPERAGENT_SPOOL_BUSINESS:-}" general)
+[ -d "$HQ_HOME/businesses/$business" ] || business=general
+defaults="$HQ_HOME/businesses/$business"
+type=$(pick "${DSH_SUPERAGENT_INBOX_TYPE:-}" "${DSH_SUPERAGENT_TIMER_TYPE:-}" "${DSH_SUPERAGENT_SPOOL_TYPE:-}" "$(cat "$defaults/type" 2>/dev/null || true)" general)
+repo=$(pick "${DSH_SUPERAGENT_INBOX_REPO:-}" "${DSH_SUPERAGENT_SPOOL_REPO:-}" "$(cat "$defaults/repo" 2>/dev/null || true)")
+[ -d "$HQ_HOME/templates/$type" ] || type=general
+playbook() {
+  printf '<!-- Written by hq-prepare for ticket %s; business %s, type %s. -->\n\n' "$ticket" "$business" "$type"
+  cat "$HQ_HOME/shared/AGENTS.md"; printf '\n'
+  cat "$defaults/AGENTS.md"; printf '\n'
+  cat "$HQ_HOME/templates/$type/AGENTS.md"
+  printf '\n## 这张工单\n\n- 工单：%s（%s）\n- 业务：%s；类型：%s\n' "$ticket" "$name" "$business" "$type"
+  [ -n "${DSH_SUPERAGENT_INBOX_NOTE:-}" ] && printf -- '- 来源笔记：%s\n' "$DSH_SUPERAGENT_INBOX_NOTE"
+  [ -n "${DSH_SUPERAGENT_TIMER_SCHEDULE:-}" ] && printf -- '- 定时任务：%s；记录：%s\n' "$DSH_SUPERAGENT_TIMER_SCHEDULE" "${DSH_SUPERAGENT_TIMER_REPORT:-}"
+  [ -n "${DSH_SUPERAGENT_SPOOL_SENDER:-}" ] && printf -- '- 投递来源：%s / %s\n' "$DSH_SUPERAGENT_SPOOL_SENDER" "${DSH_SUPERAGENT_SPOOL_CONVERSATION:-}"
+  [ -n "$repo" ] && printf -- '- 仓库：%s\n' "$repo"
+  printf -- '- 业务知识库：%s/knowledge（可读可追加）\n' "$defaults"
+  printf -- '- AgentHQ 主目录：%s（各业务说明在 businesses/<id>/AGENTS.md）\n' "$HQ_HOME"
+}
+meta() {
+  printf '{"ticket":"%s","name":"%s","business":"%s","type":"%s","repo":"%s","note":"%s","schedule":"%s","created":"%s"}\n' \
+    "$ticket" "$name" "$business" "$type" "$repo" "${DSH_SUPERAGENT_INBOX_NOTE:-}" "${DSH_SUPERAGENT_TIMER_SCHEDULE:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+if [ "$type" = code ]; then
+  if [ -z "$repo" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "This code ticket names no git repository (repo: '$repo'). Add 'repo: /absolute/path' to the note's front matter, then write in the note again." >&2
+    exit 1
+  fi
+  base=$(git -C "$repo" rev-parse HEAD)
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/agent/$name"; then
+    git -C "$repo" worktree add -q "$dir" "agent/$name"
+  else
+    git -C "$repo" worktree add -q -b "agent/$name" "$dir" "$base"
+  fi
+  common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+  mkdir -p "$common/info"
+  grep -qx '/.hq/' "$common/info/exclude" 2>/dev/null || printf '/.hq/\n' >> "$common/info/exclude"
+  mkdir -p "$dir/.hq/jobs"
+  cp "$HQ_HOME/templates/code/STATE.md" "$dir/.hq/STATE.md"
+  cp "$HQ_HOME/templates/code/check.sh" "$dir/.hq/check.sh"; chmod +x "$dir/.hq/check.sh"
+  : > "$dir/.hq/check.cmd"
+  printf '%s\n' "$base" > "$dir/.hq/base"
+  playbook > "$dir/.hq/AGENTS.md"
+  ln -s "$defaults/knowledge" "$dir/.hq/knowledge"
+  meta > "$dir/.hq/ticket.json"
+  # The repository's own AGENTS.md stays in charge of the code; the AgentHQ playbook joins it as a local overlay that git ignores.
+  printf 'Read .hq/AGENTS.md (AgentHQ rules for this ticket) and .hq/STATE.md first.\n' > "$dir/.hq/README"
+  [ -e "$dir/AGENTS.local.md" ] || { cp "$dir/.hq/AGENTS.md" "$dir/AGENTS.local.md"; grep -qx '/AGENTS.local.md' "$common/info/exclude" || printf '/AGENTS.local.md\n' >> "$common/info/exclude"; }
+else
+  mkdir -p "$dir"
+  cp -R "$HQ_HOME/templates/$type/." "$dir/"
+  mkdir -p "$dir/.hq/jobs"
+  playbook > "$dir/AGENTS.md"
+  ln -s "$defaults/knowledge" "$dir/knowledge"
+  meta > "$dir/.hq/ticket.json"
+  git -C "$dir" init -q
+  git -C "$dir" config user.name AgentHQ
+  git -C "$dir" config user.email agenthq@localhost
+  printf '.hq/jobs/\nknowledge\n' > "$dir/.gitignore"
+  git -C "$dir" add -A && git -C "$dir" commit -q -m "ticket $name: start from the $type template"
+fi
+echo "prepared $dir ($business/$type)"

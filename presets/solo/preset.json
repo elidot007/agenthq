@@ -1,0 +1,65 @@
+{
+  "description": "一个人做产品：调研、写代码、写内容、运维",
+  "businesses": [
+    {
+      "id": "research",
+      "title": "调研",
+      "type": "research",
+      "repo": ""
+    },
+    {
+      "id": "product",
+      "title": "产品开发",
+      "type": "code",
+      "repo": ""
+    },
+    {
+      "id": "content",
+      "title": "内容与增长",
+      "type": "content",
+      "repo": ""
+    },
+    {
+      "id": "ops",
+      "title": "运维值守",
+      "type": "ops",
+      "repo": ""
+    },
+    {
+      "id": "general",
+      "title": "综合",
+      "type": "general",
+      "repo": ""
+    }
+  ],
+  "schedules": [
+    {
+      "id": "daily-digest",
+      "cron": "30 8 * * *",
+      "business": "general",
+      "type": "routine",
+      "state": "on",
+      "text": "写今天的 AgentHQ 早报：运行 `hq status --json` 和 `hq notes --days 1`，汇总过去 24 小时完成的工单、等我处理的事（待回答、待验收、受阻、失败）和今天到期的事。等我处理的事放最前面，每条给出笔记路径。没有新内容时报告 dropped。"
+    }
+  ],
+  "senders": [
+    {
+      "id": "cli",
+      "kind": "person",
+      "business": "general"
+    },
+    {
+      "id": "monitor",
+      "kind": "bot",
+      "business": "ops"
+    }
+  ],
+  "rules": [
+    {
+      "id": "ops-alert",
+      "name": "Service alerts",
+      "enabled": true,
+      "instruction": "A monitor or an automation reports that a service the operator runs failed: a site or API is down, a job failed, errors spiked. Diagnose read-only and try to reproduce; report the cause, the evidence and a proposed fix. Restarting, rolling back or deploying needs the operator's answer first. If it already recovered or does not reproduce, report dropped."
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+# AgentHQ instance (dsh-superagent with the AgentHQ Sources). Written by scripts/setup.mjs; settings beyond this file live in
+# the instance and are pushed by `hq apply` from {{HQ_HOME}}/hq.config.json.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: {{PORT}}
+- id: dsh-superagent
+  config:
+    stateDir: {{STATE_DIR}}
+# The local Sources: inbox notes, schedules and ticket wakes, and the spool for local programs.
+- id: dsh-superagent-inbox
+  disabled: false
+- id: dsh-superagent-timer
+  disabled: false
+- id: dsh-superagent-spool
+  disabled: false
+{{MODEL}}{{WEB}}

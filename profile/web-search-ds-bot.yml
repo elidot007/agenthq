@@ -1,0 +1,8 @@
+# Web search for workers: the keyless `auto` search of the ds-bot package (its search plugin only, not the DS Bot team host).
+- insert:
+    - id: web-search-auto
+      name: ds-bot/web-search
+- id: web
+  config:
+    searchProvider: auto
+    fetchProvider: http

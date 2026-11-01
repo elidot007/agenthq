@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHQ 调度台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">令</span><span class="brand-name">AgentHQ</span><span class="brand-sub">调度台</span></div>
+  <label class="search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm4.8 8.6 3.7 3.7-1.1 1.1-3.7-3.7z"/></svg>
+    <input id="search" type="search" placeholder="搜索" autocomplete="off"><kbd>/</kbd></label>
+  <button class="system-chip" id="system-chip" type="button"><span class="dot"></span><span id="system-text">连接中…</span></button>
+</header>
+
+<main class="page">
+  <section class="composer rise" id="composer" aria-label="交代一件事">
+    <div class="composer-title"><h1>交代一件事</h1><span class="hint" id="composer-hint">写清要什么、交付什么、什么时候要；文件可以直接拖进来</span></div>
+    <div class="drop" id="drop">
+      <textarea id="ask-text" rows="3" spellcheck="false"></textarea>
+      <div class="attachments" id="attachments"></div>
+      <div class="drop-veil">松开，作为附件交给 AgentHQ</div>
+    </div>
+    <div class="composer-line"><span class="label">交给</span><div class="chips" id="biz-chips" role="radiogroup" aria-label="业务"></div><span class="sub biz-hint" id="biz-hint"></span></div>
+    <div class="composer-line wrap">
+      <span class="label">截止</span>
+      <div class="seg" id="deadline-seg" role="radiogroup" aria-label="截止">
+        <button type="button" data-v="">不限</button><button type="button" data-v="today">今天</button><button type="button" data-v="tomorrow">明天</button><button type="button" data-v="friday">本周五</button><button type="button" data-v="pick">选日期</button>
+      </div>
+      <input type="date" id="deadline-date" class="mini" hidden>
+      <span class="label gap">重复</span>
+      <div class="seg" id="repeat-seg" role="radiogroup" aria-label="重复">
+        <button type="button" data-v="">一次</button><button type="button" data-v="daily">每天</button><button type="button" data-v="weekdays">工作日</button><button type="button" data-v="weekly">每周一</button>
+      </div>
+      <input type="time" id="repeat-time" class="mini" value="09:00" hidden>
+      <button type="button" class="text-btn" id="more-btn" aria-expanded="false">更多选项</button>
+    </div>
+    <div class="composer-more" id="composer-more" hidden>
+      <label><span>标题</span><input id="ask-title" placeholder="不填就用第一行"></label>
+      <label><span>做法</span><select id="ask-type"><option value="">按业务默认</option><option value="research">调研</option><option value="code">写代码</option><option value="content">写内容</option><option value="ops">运维排查</option><option value="general">通用</option></select></label>
+      <label id="repo-field" hidden><span>代码仓库</span><input id="ask-repo" list="repo-list" placeholder="仓库的绝对路径，例如 /home/me/projects/app"><datalist id="repo-list"></datalist></label>
+    </div>
+    <div class="composer-foot">
+      <div class="templates"><span class="label">从模板开始</span><span id="templates"></span></div>
+      <div class="send-row">
+        <span class="note" id="send-note"></span>
+        <button type="button" class="ghost" id="attach-btn">添加附件</button><input type="file" id="file-input" multiple hidden>
+        <button type="button" class="primary" id="send-btn" disabled><span id="send-text">交给 AgentHQ</span><kbd>⌘↩</kbd></button>
+      </div>
+    </div>
+  </section>
+
+  <div class="columns">
+    <section class="board rise" style="animation-delay:.06s" aria-label="请求">
+      <div class="board-head">
+        <div class="tabs" id="tabs" role="tablist"></div>
+        <select id="biz-filter" class="mini" aria-label="按业务筛选"><option value="">全部业务</option></select>
+      </div>
+      <div id="list" class="list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <aside class="side">
+      <section class="card today rise" style="animation-delay:.1s"><h2>此刻</h2><div class="stats" id="stats"></div></section>
+      <section class="card rise" style="animation-delay:.14s">
+        <div class="card-head"><h2>定时任务</h2><button type="button" class="text-btn" id="new-schedule">＋ 新建</button></div>
+        <div id="schedules" class="schedules"></div>
+      </section>
+      <section class="card rise" style="animation-delay:.18s">
+        <div class="card-head"><h2>系统</h2><button type="button" class="text-btn" id="system-more">详情</button></div>
+        <div id="system-mini" class="system-mini"></div>
+      </section>
+    </aside>
+  </div>
+</main>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="请求详情">
+  <header class="drawer-head" id="drawer-head"></header>
+  <div class="drawer-body" id="drawer-body"></div>
+  <footer class="reply" id="reply">
+    <div class="quick" id="quick"></div>
+    <div class="reply-box"><textarea id="reply-text" rows="2" placeholder="补充、回答或提修改意见（会交给同一个执行者）"></textarea>
+      <button type="button" class="primary" id="reply-send" disabled>发送<kbd>⌘↩</kbd></button></div>
+  </footer>
+</aside>
+
+<aside class="drawer narrow" id="sysdrawer" aria-hidden="true" aria-label="系统"></aside>
+
+<dialog id="preview" class="preview"><header><strong id="preview-name"></strong><span class="sub" id="preview-meta"></span>
+  <span class="spacer"></span><button type="button" class="ghost" id="preview-finder">在 Finder 中显示</button><button type="button" class="ghost" id="preview-open">打开</button><button type="button" class="icon" id="preview-close" aria-label="关闭">×</button></header>
+  <div class="preview-body" id="preview-body"></div></dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="/app.js" type="module"></script>
+</body>
+</html>
