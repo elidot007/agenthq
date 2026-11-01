@@ -37,7 +37,7 @@ AgentHQ 的数据都放在这个目录里（`inbox/`、`work/` 等），放在�
 | `--preset` | `solo` | `minimal` / `solo` / `content-studio` / `shop`，见 `presets/` |
 | `--model` | `deepseek` | `openai-compatible` 时再给 `--base-url --key-env --model-id` |
 | `--web-search` | 关 | 给执行者加免密钥联网搜索（npm 包 ds-bot 的搜索插件） |
-| `--profile` | `superagent` | DeepSeek Harness profile 名；tmux 会话叫 `dsh-<profile>` |
+| `--dsh-profile` | `superagent` | DeepSeek Harness profile 名；tmux 会话叫 `dsh-<profile>` |
 | `--port` / `--hub-port` | 3082 / 3090 | 实例面板端口 / 调度台端口 |
 | `--workers` | 3 | 同时做几张工单 |
 | `--only` / `--skip` | | 只做或跳过某几步：`config,superagent,start,service,link` |

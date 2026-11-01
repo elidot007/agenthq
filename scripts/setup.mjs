@@ -22,7 +22,7 @@ const HELP = `node scripts/setup.mjs [options]
                           any OpenAI-compatible endpoint, such as a relay or a gateway
   --relay-log <file>      a relay log with "status=<code>" lines, shown on the dashboard        optional
   --web-search            add the keyless web search of the ds-bot npm package for workers
-  --profile <name>        DeepSeek Harness profile for the instance                             default: superagent
+  --dsh-profile <name>    DeepSeek Harness profile for the instance                             default: superagent
   --port <n>              the instance's panel port                                              default: 3082
   --hub-port <n>          the dashboard port                                                     default: 3090
   --superagent-dir <dir>  where to clone the patched dsh-superagent                              default: ./vendor/dsh-superagent
@@ -55,7 +55,8 @@ const which = name => spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 
 
 const owner = opt('owner', (process.env.USER || 'me').toLowerCase().replace(/[^a-z0-9-]/g, '-'))
 if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(owner)) fail('--owner is lowercase letters, digits and dashes')
-const profile = opt('profile', 'superagent'), port = Number(opt('port', 3082)), hubPort = Number(opt('hub-port', 3090))
+// Not `--profile`: the start script would take this very process, whose arguments would name the profile, for the instance.
+const profile = opt('dsh-profile', 'superagent'), port = Number(opt('port', 3082)), hubPort = Number(opt('hub-port', 3090))
 const superagentDir = resolve(opt('superagent-dir', join(HQ_HOME, 'vendor', 'dsh-superagent')))
 const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
 const stateDir = join(dshHome, 'state', profile)
