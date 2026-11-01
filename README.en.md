@@ -8,7 +8,7 @@ Quick start (macOS or Linux; Node.js 22.19+, pnpm, git, tmux, python3, sqlite3):
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.1-rc.3
-git clone <this repo> agenthq && cd agenthq
+git clone https://github.com/elidot007/agenthq.git agenthq && cd agenthq
 export DEEPSEEK_API_KEY=sk-...
 node scripts/setup.mjs --owner me --preset solo
 open http://127.0.0.1:3090/

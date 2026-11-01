@@ -22,7 +22,7 @@ npm install -g @deepseek-ai/dsh@0.2.1-rc.3 pnpm
 ## 一键安装
 
 ```sh
-git clone <this repo> agenthq && cd agenthq
+git clone https://github.com/elidot007/agenthq.git agenthq && cd agenthq
 export DEEPSEEK_API_KEY=sk-...
 node scripts/setup.mjs --owner me --name 我 --preset solo
 ```

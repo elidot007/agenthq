@@ -58,7 +58,7 @@ flowchart LR
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.1-rc.3
-git clone <this repo> agenthq && cd agenthq
+git clone https://github.com/elidot007/agenthq.git agenthq && cd agenthq
 export DEEPSEEK_API_KEY=sk-...        # 或写进 ~/.dsh/.credentials.yaml，见 docs/models.md
 node scripts/setup.mjs --owner me --name 我 --preset solo
 ```
